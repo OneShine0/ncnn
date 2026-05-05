@@ -1,0 +1,37 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments and vendored local packages
+.venv/
+venv/
+env/
+python_packages/
+
+# Local tooling and editor state
+.vscode/
+.idea/
+
+# Temporary files and runtime output
+.tmp/
+tmp/
+temp/
+logs/
+*.log
+*.pid
+
+# Test and build artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+desktop.ini
