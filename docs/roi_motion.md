@@ -46,16 +46,16 @@
 ### Key Classes
 
 - `Roi`: Immutable rectangle data object.
-- `MotionRoiSelector`: Selects full-frame or motion-based ROIs using OpenCV MOG2.
+- `MotionRoiSelector`: Selects full-frame or motion-based ROIs using OpenCV MOG2 plus a lightweight frame-diff backup.
 
 ### Key Methods
 
 - `Roi.crop(frame)`: Crops the ROI from a frame.
 - `Roi.to_dict()`: Converts ROI data to the backend JSON shape.
 - `MotionRoiSelector.select(frame, frame_id)`: Returns a full-frame ROI, motion ROI, held ROI, or `None`.
-- `_motion_roi(frame)`: Builds a motion mask with MOG2, thresholding, morphology, and contour filtering.
+- `_motion_roi(frame)`: Builds a motion mask with MOG2 and frame-diff boxes, then applies thresholding, morphology, and contour filtering.
 - `_stabilize_motion_roi(...)`: Smooths ROI movement across frames.
 
 ### Tuning
 
-Increase `--roi-min-area` for noisy scenes, increase `--roi-padding-pixels` if targets are clipped, lower `--face-refresh-ms` for steadier still-face updates, and lower `--detection-ttl-ms` if stale boxes linger. The default `--mog2-history 80` adapts much faster than the older 500-frame background window; if still faces disappear too easily, try 100 or 120. Periodic refresh defaults to `--full-frame-refresh-mode tiles` so the model checks a 2x2 split of the current frame plus one centered tile instead of shrinking the whole frame.
+Increase `--roi-min-area` for noisy scenes, increase `--roi-padding-pixels` if targets are clipped, lower `--face-refresh-ms` for steadier still-face updates, and lower `--detection-ttl-ms` if stale boxes linger. Non-full ROI results are regional positive and negative evidence: old boxes centered inside a checked ROI are cleared if the model does not detect them again. The default `--show-expired-ttl` briefly draws TTL-pruned boxes as red dashed local-only ghosts for testing. The default `--mog2-history 80` adapts much faster than the older 500-frame background window; if still faces disappear too easily, try 100 or 120. The default `--roi-smooth-alpha 0.6` keeps the older stable ROI feel: higher values are steadier but trail movement more, while lower values react faster but can jitter. Frame-diff motion is enabled by default as a backup for subtle movement: lower `--frame-diff-threshold` is more sensitive but noisier, lower `--frame-diff-min-area` catches smaller changes but can false-trigger, and `--frame-diff-alpha` controls how quickly the reference image adapts. Periodic refresh defaults to `--full-frame-refresh-mode tiles` so the model checks the left half, right half, and one centered vertical patch instead of shrinking the whole frame. Discuss the expected effect before changing MOG2/ROI defaults.

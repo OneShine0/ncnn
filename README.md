@@ -125,9 +125,16 @@ Default mode opens camera index `0`. Use `--headless` for no preview window and 
 --roi-min-area 800
 --roi-min-size-pixels 96
 --roi-padding-pixels 50
+--roi-smooth-alpha 0.6
 --face-refresh-ms 500
 --detection-ttl-ms 500
+--show-expired-ttl
+--expired-ttl-display-frames 8
 --mog2-history 80
+--frame-diff-enabled
+--frame-diff-threshold 12
+--frame-diff-min-area 300
+--frame-diff-alpha 0.08
 --status-overlay compact
 --backend-url http://HOST:PORT/api/detections
 --device-id pi-camera-01
@@ -139,7 +146,7 @@ Default mode opens camera index `0`. Use `--headless` for no preview window and 
 - `roi`：第一帧全图，之后主要依赖运动 ROI。
 - `full`：每帧全图检测，最稳定但最慢。
 
-The default `hybrid` mode balances stability and speed. It uses motion ROIs, cached-face rechecks, and time-sliced refresh tiles: a true 2x2 split of the current frame plus one centered tile across each `--full-frame-refresh-ms` cycle. On 640x640 frames the 2x2 tiles are 320x320, and the centered tile is `[160,160,480,480]`. Cached boxes expire after `--detection-ttl-ms` by default, and `--status-overlay compact` uses a vertical semi-transparent test panel.
+The default `hybrid` mode balances stability and speed. It uses motion ROIs, cached-face rechecks, and time-sliced refresh tiles: the left half, right half, and one centered vertical patch across each `--full-frame-refresh-ms` cycle. On 640x640 frames the centered patch is `[160,0,480,640]`. Non-full ROIs are regional evidence: old boxes whose centers fall inside the checked ROI are cleared first, then the new ROI detections are added. Cached boxes expire after `--detection-ttl-ms` by default; during testing, `--show-expired-ttl` draws a short red dashed `TTL expired` ghost so stale-box removal is visible. `--status-overlay compact` uses a vertical semi-transparent test panel. `--roi-smooth-alpha 0.6` follows the older stable ROI feel; higher values are steadier but trail movement more, while lower values are more responsive but can jitter. Frame-diff motion is enabled by default as a lightweight backup for subtle movement; lower `--frame-diff-threshold` is more sensitive but noisier, and lower `--frame-diff-min-area` catches smaller changes but can false-trigger more easily.
 
 ## 树莓派快速入口 / Raspberry Pi Quick Link
 

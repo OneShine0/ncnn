@@ -49,6 +49,10 @@ class MotionRoiSelector:
         var_threshold: float = 50.0,
         hold_frames: int = 0,
         smooth_alpha: float = 0.6,
+        frame_diff_enabled: bool = True,
+        frame_diff_threshold: int = 12,
+        frame_diff_min_area: int = 300,
+        frame_diff_alpha: float = 0.08,
     ) -> None:
         if mode not in {"hybrid", "roi", "full"}:
             raise ValueError(f"Unknown ROI mode: {mode}")
@@ -59,6 +63,10 @@ class MotionRoiSelector:
         self.padding_pixels = max(0, int(padding_pixels))
         self.hold_frames = max(0, hold_frames)
         self.smooth_alpha = min(max(smooth_alpha, 0.0), 1.0)
+        self.frame_diff_enabled = bool(frame_diff_enabled)
+        self.frame_diff_threshold = max(1, int(frame_diff_threshold))
+        self.frame_diff_min_area = max(1, int(frame_diff_min_area))
+        self.frame_diff_alpha = min(max(frame_diff_alpha, 0.0), 1.0)
         self._subtractor = cv2.createBackgroundSubtractorMOG2(
             history=history,
             varThreshold=var_threshold,
@@ -67,6 +75,7 @@ class MotionRoiSelector:
         self._kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         self._held_roi: Roi | None = None
         self._hold_remaining = 0
+        self._diff_reference: np.ndarray | None = None
 
     def select(self, frame: np.ndarray, frame_id: int) -> Roi | None:
         h, w = frame.shape[:2]
@@ -96,12 +105,12 @@ class MotionRoiSelector:
         return None
 
     def _motion_roi(self, frame: np.ndarray) -> Roi | None:
+        boxes: list[tuple[int, int, int, int]] = []
+
         mask = self._subtractor.apply(frame)
         _, mask = cv2.threshold(mask, 200, 255, cv2.THRESH_BINARY)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._kernel, iterations=1)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._kernel, iterations=1)
-
-        boxes: list[tuple[int, int, int, int]] = []
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for contour in contours:
             area = float(cv2.contourArea(contour))
@@ -109,6 +118,9 @@ class MotionRoiSelector:
                 continue
             x, y, w, h = cv2.boundingRect(contour)
             boxes.append((x, y, x + w, y + h))
+
+        if self.frame_diff_enabled:
+            boxes.extend(self._frame_diff_boxes(frame))
 
         if not boxes:
             return None
@@ -133,6 +145,33 @@ class MotionRoiSelector:
         if x2 <= x1 or y2 <= y1:
             return None
         return Roi(x1, y1, x2, y2, "motion")
+
+    def _frame_diff_boxes(self, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        gray_f = gray.astype(np.float32)
+        if self._diff_reference is None:
+            self._diff_reference = gray_f
+            return []
+
+        reference_u8 = cv2.convertScaleAbs(self._diff_reference)
+        diff = cv2.absdiff(gray, reference_u8)
+        _, mask = cv2.threshold(diff, self.frame_diff_threshold, 255, cv2.THRESH_BINARY)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._kernel, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._kernel, iterations=1)
+
+        boxes: list[tuple[int, int, int, int]] = []
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours:
+            area = float(cv2.contourArea(contour))
+            if area < self.frame_diff_min_area:
+                continue
+            x, y, w, h = cv2.boundingRect(contour)
+            boxes.append((x, y, x + w, y + h))
+
+        if self.frame_diff_alpha > 0.0:
+            cv2.accumulateWeighted(gray_f, self._diff_reference, self.frame_diff_alpha)
+        return boxes
 
     def _stabilize_motion_roi(self, roi: Roi, frame_shape: tuple[int, int]) -> Roi:
         if self._held_roi is None or self.smooth_alpha <= 0.0:

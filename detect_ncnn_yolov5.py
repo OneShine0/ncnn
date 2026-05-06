@@ -68,6 +68,7 @@ class DetectionCache:
         self.match_iou = match_iou
         self.dedupe_iou = dedupe_iou
         self._tracks: list[TrackedDetection] = []
+        self._expired_tracks: list[TrackedDetection] = []
 
     def set_ttl_frames(self, ttl_frames: int) -> None:
         self.ttl_frames = max(0, int(ttl_frames))
@@ -106,14 +107,24 @@ class DetectionCache:
             self._tracks.append(TrackedDetection(det.astype(np.float32, copy=True), frame_id))
         self._dedupe_tracks()
 
-    def prune(self, frame_id: int) -> None:
+    def prune(self, frame_id: int) -> list[TrackedDetection]:
         if self.ttl_frames == 0:
-            return
-        self._tracks = [
-            track
-            for track in self._tracks
-            if frame_id - track.last_seen_frame <= self.ttl_frames
-        ]
+            return []
+        kept: list[TrackedDetection] = []
+        expired: list[TrackedDetection] = []
+        for track in self._tracks:
+            if frame_id - track.last_seen_frame <= self.ttl_frames:
+                kept.append(track)
+            else:
+                expired.append(track)
+        self._tracks = kept
+        self._expired_tracks.extend(expired)
+        return expired
+
+    def pop_expired_tracks(self) -> list[TrackedDetection]:
+        expired = self._expired_tracks
+        self._expired_tracks = []
+        return expired
 
     def snapshot(self, frame_id: int) -> tuple[np.ndarray, list[bool]]:
         self.prune(frame_id)
@@ -148,6 +159,25 @@ class DetectionCache:
         detections = np.stack([track.values for track in self._tracks]).astype(np.float32)
         keep_indices = nms_indices(detections, self.dedupe_iou, mode="class_agnostic")
         self._tracks = [self._tracks[idx] for idx in keep_indices]
+
+
+class ExpiredDetectionOverlay:
+    def __init__(self, display_frames: int = 8) -> None:
+        self.display_frames = max(0, int(display_frames))
+        self._items: list[tuple[np.ndarray, int]] = []
+
+    def add_tracks(self, tracks: list[TrackedDetection], frame_id: int) -> None:
+        if self.display_frames == 0:
+            return
+        expire_at = frame_id + self.display_frames
+        for track in tracks:
+            self._items.append((track.values.astype(np.float32, copy=True), expire_at))
+
+    def snapshot(self, frame_id: int) -> np.ndarray:
+        self._items = [(values, expire_at) for values, expire_at in self._items if expire_at >= frame_id]
+        if not self._items:
+            return np.empty((0, 6), dtype=np.float32)
+        return np.stack([values for values, _expire_at in self._items]).astype(np.float32)
 
 
 class TextRenderer:
@@ -318,10 +348,14 @@ def box_iou(box_a: np.ndarray, box_b: np.ndarray) -> float:
     return 0.0 if union <= 0.0 else inter / union
 
 
-def box_center_in_roi(box: np.ndarray, roi: Roi) -> bool:
+def box_center_in_roi(box: np.ndarray, roi: Roi, margin_pixels: int = 0) -> bool:
+    margin = max(0, int(margin_pixels))
     center_x = (float(box[0]) + float(box[2])) / 2.0
     center_y = (float(box[1]) + float(box[3])) / 2.0
-    return roi.x1 <= center_x <= roi.x2 and roi.y1 <= center_y <= roi.y2
+    return (
+        roi.x1 - margin <= center_x <= roi.x2 + margin
+        and roi.y1 - margin <= center_y <= roi.y2 + margin
+    )
 
 
 def ttl_frames_from_args(args: argparse.Namespace, fps: float) -> int:
@@ -374,17 +408,14 @@ def refresh_tiles(frame_shape: tuple[int, int], tile_size: int) -> list[Roi]:
         return []
 
     mid_x = min(max(1, frame_w // 2), frame_w)
-    mid_y = min(max(1, frame_h // 2), frame_h)
-    center_w = max(mid_x, frame_w - mid_x)
-    center_h = max(mid_y, frame_h - mid_y)
+    center_w = max(1, frame_w - mid_x)
+    center_h = frame_h
     center_x1 = max(0, (frame_w - center_w) // 2)
-    center_y1 = max(0, (frame_h - center_h) // 2)
+    center_y1 = 0
 
     positions = [
-        (0, 0, mid_x, mid_y),
-        (mid_x, 0, frame_w, mid_y),
-        (0, mid_y, mid_x, frame_h),
-        (mid_x, mid_y, frame_w, frame_h),
+        (0, 0, mid_x, frame_h),
+        (mid_x, 0, frame_w, frame_h),
         (center_x1, center_y1, center_x1 + center_w, center_y1 + center_h),
     ]
     rois: list[Roi] = []
@@ -410,20 +441,14 @@ def union_roi_with_detections(
     frame_shape: tuple[int, int],
     proximity_pixels: int = 0,
 ) -> Roi:
-    if roi.reason != "motion" or detections.size == 0:
+    if roi.reason == "full" or detections.size == 0:
         return roi
 
     frame_h, frame_w = frame_shape
     gap = max(0, int(proximity_pixels))
-    near_x1 = max(0, roi.x1 - gap)
-    near_y1 = max(0, roi.y1 - gap)
-    near_x2 = min(frame_w, roi.x2 + gap)
-    near_y2 = min(frame_h, roi.y2 + gap)
-    nearby_mask = (
-        (detections[:, 2] >= near_x1)
-        & (detections[:, 0] <= near_x2)
-        & (detections[:, 3] >= near_y1)
-        & (detections[:, 1] <= near_y2)
+    nearby_mask = np.array(
+        [box_center_in_roi(det[:4], roi, margin_pixels=gap) for det in detections],
+        dtype=bool,
     )
     nearby = detections[nearby_mask]
     if nearby.size == 0:
@@ -703,6 +728,42 @@ def draw_detections(
     return out
 
 
+def draw_dashed_rectangle(
+    image: np.ndarray,
+    p1: tuple[int, int],
+    p2: tuple[int, int],
+    color: tuple[int, int, int],
+    thickness: int = 1,
+    dash_length: int = 8,
+) -> None:
+    x1, y1 = p1
+    x2, y2 = p2
+    dash = max(2, int(dash_length))
+    for x in range(x1, x2, dash * 2):
+        cv2.line(image, (x, y1), (min(x + dash, x2), y1), color, thickness)
+        cv2.line(image, (x, y2), (min(x + dash, x2), y2), color, thickness)
+    for y in range(y1, y2, dash * 2):
+        cv2.line(image, (x1, y), (x1, min(y + dash, y2)), color, thickness)
+        cv2.line(image, (x2, y), (x2, min(y + dash, y2)), color, thickness)
+
+
+def draw_expired_detections(
+    image: np.ndarray,
+    expired_detections: np.ndarray,
+    text_renderer: TextRenderer,
+) -> np.ndarray:
+    if expired_detections.size == 0:
+        return image
+    out = image.copy()
+    color = (0, 0, 255)
+    for x1, y1, x2, y2, _score, _class_id in expired_detections:
+        p1 = (int(round(x1)), int(round(y1)))
+        p2 = (int(round(x2)), int(round(y2)))
+        draw_dashed_rectangle(out, p1, p2, color, thickness=1, dash_length=8)
+        out = text_renderer.put_text(out, "TTL expired", (p1[0], max(14, p1[1] - 4)), color, scale=0.45, thickness=1)
+    return out
+
+
 def draw_status(
     image: np.ndarray,
     text_renderer: TextRenderer,
@@ -845,6 +906,10 @@ def run_video(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> Non
         var_threshold=args.mog2_var_threshold,
         hold_frames=args.roi_hold_frames,
         smooth_alpha=args.roi_smooth_alpha,
+        frame_diff_enabled=args.frame_diff_enabled,
+        frame_diff_threshold=args.frame_diff_threshold,
+        frame_diff_min_area=args.frame_diff_min_area,
+        frame_diff_alpha=args.frame_diff_alpha,
     )
     backend = BackendClient(args.backend_url, timeout=args.backend_timeout, max_queue=args.backend_queue)
     text_renderer = TextRenderer()
@@ -853,6 +918,7 @@ def run_video(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> Non
         ttl_frames=ttl_frames_from_args(args, output_fps),
         dedupe_iou=args.iou_thres,
     )
+    expired_overlay = ExpiredDetectionOverlay(args.expired_ttl_display_frames)
     refresh_scheduler = RefreshTileScheduler(
         args.full_frame_refresh_mode,
         args.full_frame_refresh_ms,
@@ -916,10 +982,8 @@ def run_video(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> Non
                 raw_detections, inference_ms = detect_roi(net, frame, roi, args)
                 if roi.reason == "full":
                     detection_cache.update_full(raw_detections, frame_id)
-                elif roi.reason == "tile":
-                    detection_cache.update_region(raw_detections, frame_id, roi)
                 else:
-                    detection_cache.update_motion(raw_detections, frame_id)
+                    detection_cache.update_region(raw_detections, frame_id, roi)
                 last_face_refresh_time = now
                 detections, cached_flags = detection_cache.snapshot(frame_id)
                 last_inference_ms = inference_ms
@@ -939,7 +1003,15 @@ def run_video(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> Non
                 detections, _cached_flags = detection_cache.snapshot(frame_id)
                 inference_ms = last_inference_ms
 
+            if args.show_expired_ttl:
+                expired_overlay.add_tracks(detection_cache.pop_expired_tracks(), frame_id)
+                expired_detections = expired_overlay.snapshot(frame_id)
+            else:
+                detection_cache.pop_expired_tracks()
+                expired_detections = np.empty((0, 6), dtype=np.float32)
+
             rendered = draw_detections(frame, detections, labels, text_renderer)
+            rendered = draw_expired_detections(rendered, expired_detections, text_renderer)
             rendered = draw_status(
                 rendered,
                 text_renderer,
@@ -1004,11 +1076,16 @@ def run_camera(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> No
         var_threshold=args.mog2_var_threshold,
         hold_frames=args.roi_hold_frames,
         smooth_alpha=args.roi_smooth_alpha,
+        frame_diff_enabled=args.frame_diff_enabled,
+        frame_diff_threshold=args.frame_diff_threshold,
+        frame_diff_min_area=args.frame_diff_min_area,
+        frame_diff_alpha=args.frame_diff_alpha,
     )
     backend = BackendClient(args.backend_url, timeout=args.backend_timeout, max_queue=args.backend_queue)
     text_renderer = TextRenderer()
     fps_meter = FpsMeter()
     detection_cache = DetectionCache(ttl_frames=ttl_frames_from_args(args, 0.0), dedupe_iou=args.iou_thres)
+    expired_overlay = ExpiredDetectionOverlay(args.expired_ttl_display_frames)
     refresh_scheduler = RefreshTileScheduler(
         args.full_frame_refresh_mode,
         args.full_frame_refresh_ms,
@@ -1072,10 +1149,8 @@ def run_camera(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> No
                 raw_detections, inference_ms = detect_roi(net, frame, roi, args)
                 if roi.reason == "full":
                     detection_cache.update_full(raw_detections, frame_id)
-                elif roi.reason == "tile":
-                    detection_cache.update_region(raw_detections, frame_id, roi)
                 else:
-                    detection_cache.update_motion(raw_detections, frame_id)
+                    detection_cache.update_region(raw_detections, frame_id, roi)
                 last_face_refresh_time = now
                 detections, cached_flags = detection_cache.snapshot(frame_id)
                 last_inference_ms = inference_ms
@@ -1095,10 +1170,18 @@ def run_camera(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> No
                 detections, cached_flags = detection_cache.snapshot(frame_id)
                 inference_ms = last_inference_ms
 
+            if args.show_expired_ttl:
+                expired_overlay.add_tracks(detection_cache.pop_expired_tracks(), frame_id)
+                expired_detections = expired_overlay.snapshot(frame_id)
+            else:
+                detection_cache.pop_expired_tracks()
+                expired_detections = np.empty((0, 6), dtype=np.float32)
+
             if args.headless:
                 continue
 
             rendered = draw_detections(frame, detections, labels, text_renderer)
+            rendered = draw_expired_detections(rendered, expired_detections, text_renderer)
             rendered = draw_status(
                 rendered,
                 text_renderer,
@@ -1166,15 +1249,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--roi-padding", type=float, default=0.15)
     parser.add_argument("--roi-padding-pixels", type=int, default=50)
     parser.add_argument("--roi-hold-frames", type=int, default=0)
-    parser.add_argument("--roi-smooth-alpha", type=float, default=0.35)
+    parser.add_argument("--roi-smooth-alpha", type=float, default=0.6)
     parser.add_argument("--face-refresh-ms", type=float, default=500.0)
     parser.add_argument("--cached-roi-interval", type=int, default=0)
     parser.add_argument("--cached-roi-padding-pixels", type=int, default=60)
     parser.add_argument("--detection-ttl-ms", type=float, default=500.0)
     parser.add_argument("--detection-ttl-frames", type=int)
+    parser.add_argument("--show-expired-ttl", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--expired-ttl-display-frames", type=int, default=8)
     parser.add_argument("--status-overlay", choices=("compact", "full", "off"), default="compact")
     parser.add_argument("--mog2-history", type=int, default=80)
     parser.add_argument("--mog2-var-threshold", type=float, default=25.0)
+    parser.add_argument("--frame-diff-enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--frame-diff-threshold", type=int, default=12)
+    parser.add_argument("--frame-diff-min-area", type=int, default=300)
+    parser.add_argument("--frame-diff-alpha", type=float, default=0.08)
     parser.add_argument("--backend-url")
     parser.add_argument("--backend-timeout", type=float, default=1.0)
     parser.add_argument("--backend-queue", type=int, default=8)

@@ -217,12 +217,19 @@ python3 detect_ncnn_yolov5.py \
   --full-frame-refresh-mode tiles \
   --full-frame-refresh-ms 2000 \
   --roi-padding-pixels 50 \
+  --roi-smooth-alpha 0.6 \
   --face-refresh-ms 500 \
   --detection-ttl-ms 500 \
+  --show-expired-ttl \
+  --expired-ttl-display-frames 8 \
+  --frame-diff-enabled \
+  --frame-diff-threshold 12 \
+  --frame-diff-min-area 300 \
+  --frame-diff-alpha 0.08 \
   --status-overlay compact
 ```
 
-Default refresh behavior checks five tiles over each refresh cycle: a true 2x2 split of the current frame plus one centered tile. On 640x640 frames the 2x2 tiles are 320x320, and the centered tile is `[160,160,480,480]`. This avoids shrinking the whole frame on every periodic refresh while keeping Raspberry Pi load to at most one inference per frame.
+Default refresh behavior checks three tiles over each refresh cycle: the left half, the right half, and one centered vertical patch. On 640x640 frames the centered patch is `[160,0,480,640]`. This avoids shrinking the whole frame on every periodic refresh while keeping Raspberry Pi load to at most one inference per frame. Non-full ROI detections are regional evidence: stale boxes inside the checked ROI are removed if they are not detected again. During testing, TTL-expired boxes are briefly drawn as red dashed `TTL expired` ghosts. Frame-diff motion is enabled by default as a lightweight backup for subtle movement; lower threshold values are more sensitive but noisier.
 
 调参顺序：
 

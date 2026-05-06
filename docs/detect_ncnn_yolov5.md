@@ -62,8 +62,8 @@
 
 - `FpsMeter`: Tracks loop FPS with smoothing.
 - `TrackedDetection`: Stores one detection and the last frame where it was refreshed.
-- `DetectionCache`: Keeps stable detections across ROI frames, expires stale boxes with TTL, and clears boxes from checked refresh regions.
-- `RefreshTileScheduler`: Time-slices periodic refreshes across a true 2x2 frame split and one centered tile.
+- `DetectionCache`: Keeps stable detections across ROI frames, treats non-full ROI results as regional evidence, expires stale boxes with TTL, and reports TTL-expired boxes for local visualization.
+- `RefreshTileScheduler`: Time-slices periodic refreshes across the left half, right half, and one centered vertical patch.
 - `TextRenderer`: Draws labels with PIL fonts when available, with OpenCV text as fallback.
 
 ### Key Functions
