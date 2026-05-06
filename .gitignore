@@ -20,6 +20,7 @@ temp/
 logs/
 *.log
 *.pid
+videos/
 
 # Test and build artifacts
 .pytest_cache/

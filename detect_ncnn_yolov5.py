@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import platform
 import sys
 import time
@@ -68,6 +69,9 @@ class DetectionCache:
         self.dedupe_iou = dedupe_iou
         self._tracks: list[TrackedDetection] = []
 
+    def set_ttl_frames(self, ttl_frames: int) -> None:
+        self.ttl_frames = max(0, int(ttl_frames))
+
     def update_full(self, detections: np.ndarray, frame_id: int) -> None:
         self._tracks = [
             TrackedDetection(det.astype(np.float32, copy=True), frame_id) for det in detections
@@ -86,6 +90,20 @@ class DetectionCache:
                 self._tracks.append(TrackedDetection(det.astype(np.float32, copy=True), frame_id))
             else:
                 self._tracks[match_idx] = TrackedDetection(det.astype(np.float32, copy=True), frame_id)
+        self._dedupe_tracks()
+
+    def update_region(
+        self,
+        detections: np.ndarray,
+        frame_id: int,
+        roi: Roi,
+    ) -> None:
+        self.prune(frame_id)
+        self._tracks = [
+            track for track in self._tracks if not box_center_in_roi(track.values[:4], roi)
+        ]
+        for det in detections:
+            self._tracks.append(TrackedDetection(det.astype(np.float32, copy=True), frame_id))
         self._dedupe_tracks()
 
     def prune(self, frame_id: int) -> None:
@@ -298,6 +316,92 @@ def box_iou(box_a: np.ndarray, box_b: np.ndarray) -> float:
     area_b = max(0.0, float(box_b[2] - box_b[0])) * max(0.0, float(box_b[3] - box_b[1]))
     union = area_a + area_b - inter
     return 0.0 if union <= 0.0 else inter / union
+
+
+def box_center_in_roi(box: np.ndarray, roi: Roi) -> bool:
+    center_x = (float(box[0]) + float(box[2])) / 2.0
+    center_y = (float(box[1]) + float(box[3])) / 2.0
+    return roi.x1 <= center_x <= roi.x2 and roi.y1 <= center_y <= roi.y2
+
+
+def ttl_frames_from_args(args: argparse.Namespace, fps: float) -> int:
+    explicit_frames = getattr(args, "detection_ttl_frames", None)
+    if explicit_frames is not None:
+        return max(0, int(explicit_frames))
+    ttl_ms = max(0.0, float(getattr(args, "detection_ttl_ms", 0.0)))
+    if ttl_ms <= 0.0:
+        return 0
+    effective_fps = fps if fps and fps > 1.0 else float(getattr(args, "camera_fps", 0) or 25.0)
+    return max(1, int(math.ceil(effective_fps * ttl_ms / 1000.0)))
+
+
+class RefreshTileScheduler:
+    def __init__(self, mode: str, interval_ms: float, tile_size: int) -> None:
+        if mode not in {"full", "tiles"}:
+            raise ValueError(f"Unknown full-frame refresh mode: {mode}")
+        self.mode = mode
+        self.interval_ms = max(0.0, float(interval_ms))
+        self.tile_size = max(1, int(tile_size))
+        self._next_due_time: float | None = None
+        self._tile_index = 0
+
+    def next_due_roi(self, frame_shape: tuple[int, int], now: float) -> Roi | None:
+        if self.interval_ms <= 0.0:
+            return None
+        if self._next_due_time is None:
+            self._next_due_time = now + self.interval_ms / 1000.0
+            return None
+        if now < self._next_due_time:
+            return None
+
+        h, w = frame_shape
+        if self.mode == "full":
+            self._next_due_time = now + self.interval_ms / 1000.0
+            return Roi(0, 0, w, h, "full")
+
+        tiles = refresh_tiles(frame_shape, self.tile_size)
+        if not tiles:
+            return None
+        roi = tiles[self._tile_index % len(tiles)]
+        self._tile_index += 1
+        self._next_due_time = now + (self.interval_ms / len(tiles)) / 1000.0
+        return roi
+
+
+def refresh_tiles(frame_shape: tuple[int, int], tile_size: int) -> list[Roi]:
+    frame_h, frame_w = frame_shape
+    if frame_w <= 0 or frame_h <= 0:
+        return []
+
+    mid_x = min(max(1, frame_w // 2), frame_w)
+    mid_y = min(max(1, frame_h // 2), frame_h)
+    center_w = max(mid_x, frame_w - mid_x)
+    center_h = max(mid_y, frame_h - mid_y)
+    center_x1 = max(0, (frame_w - center_w) // 2)
+    center_y1 = max(0, (frame_h - center_h) // 2)
+
+    positions = [
+        (0, 0, mid_x, mid_y),
+        (mid_x, 0, frame_w, mid_y),
+        (0, mid_y, mid_x, frame_h),
+        (mid_x, mid_y, frame_w, frame_h),
+        (center_x1, center_y1, center_x1 + center_w, center_y1 + center_h),
+    ]
+    rois: list[Roi] = []
+    seen: set[tuple[int, int, int, int]] = set()
+    for x1, y1, x2, y2 in positions:
+        x1 = min(max(0, int(x1)), frame_w)
+        y1 = min(max(0, int(y1)), frame_h)
+        x2 = min(max(x1, int(x2)), frame_w)
+        y2 = min(max(y1, int(y2)), frame_h)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        roi = Roi(x1, y1, x2, y2, "tile")
+        key = (roi.x1, roi.y1, roi.x2, roi.y2)
+        if key not in seen:
+            rois.append(roi)
+            seen.add(key)
+    return rois
 
 
 def union_roi_with_detections(
@@ -607,9 +711,62 @@ def draw_status(
     roi: Roi | None,
     detections: np.ndarray,
     skipped: bool,
+    mode: str = "compact",
+    ttl_frames: int | None = None,
+    ttl_ms: float | None = None,
+    refresh_mode: str | None = None,
 ) -> np.ndarray:
+    if mode == "off":
+        return image
+
     status_text = "Status: Sleep (No Motion)" if skipped else "Status: Detecting"
     status_color = (150, 150, 150) if skipped else (0, 0, 255)
+
+    if roi is not None:
+        cv2.rectangle(image, (roi.x1, roi.y1), (roi.x2, roi.y2), ROI_COLOR, 2)
+
+    if mode == "compact":
+        roi_text = roi.reason if roi is not None else "none"
+        infer_text = f"{inference_ms:.0f}ms" if not skipped else "skip"
+        roi_box = (
+            f"{roi.x1},{roi.y1},{roi.x2},{roi.y2}" if roi is not None else "-"
+        )
+        if ttl_frames is not None:
+            ttl_text = f"{ttl_frames}f"
+        elif ttl_ms is not None:
+            ttl_text = f"{ttl_ms:.0f}ms"
+        else:
+            ttl_text = "-"
+        lines = [
+            status_text.replace("Status: ", ""),
+            f"FPS: {fps:.1f}",
+            f"Infer: {infer_text}",
+            f"Detections: {len(detections)}",
+            f"ROI: {roi_text}",
+            f"Box: {roi_box}",
+            f"TTL: {ttl_text}",
+            f"Refresh: {refresh_mode or '-'}",
+        ]
+        text_scale = 0.48
+        line_height = 18
+        max_text_width = 0
+        for line in lines:
+            (tw, _th), _baseline = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, text_scale, 1)
+            max_text_width = max(max_text_width, tw)
+        panel_width = min(max(150, max_text_width + 20), min(300, max(120, image.shape[1] - 16)))
+        panel_height = min(10 + line_height * len(lines), max(30, image.shape[0] - 16))
+        overlay = image.copy()
+        cv2.rectangle(overlay, (8, 8), (8 + panel_width, 8 + panel_height), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.5, image, 0.5, 0, image)
+        y = 26
+        for idx, line in enumerate(lines):
+            color = status_color if idx == 0 else (255, 255, 255)
+            image = text_renderer.put_text(image, line, (16, y), color, scale=text_scale, thickness=1)
+            y += line_height
+            if y > 8 + panel_height - 4:
+                break
+        return image
+
     lines = [
         status_text,
         f"FPS: {fps:.1f}",
@@ -620,7 +777,6 @@ def draw_status(
         lines.append("Using last detections")
     elif roi:
         lines.append(f"ROI: {roi.reason} [{roi.x1},{roi.y1},{roi.x2},{roi.y2}]")
-        cv2.rectangle(image, (roi.x1, roi.y1), (roi.x2, roi.y2), ROI_COLOR, 2)
         image = draw_label(image, text_renderer, f"ROI: {roi.reason}", (roi.x1, roi.y1), ROI_COLOR)
     else:
         lines.append("ROI: none")
@@ -647,7 +803,19 @@ def run_image(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> Non
         output_path = args.image.with_name(f"{args.image.stem}_ncnn{args.image.suffix}")
 
     rendered = draw_detections(image, detections, labels, TextRenderer())
-    rendered = draw_status(rendered, TextRenderer(), 0.0, elapsed_ms, full_roi, detections, skipped=False)
+    rendered = draw_status(
+        rendered,
+        TextRenderer(),
+        0.0,
+        elapsed_ms,
+        full_roi,
+        detections,
+        skipped=False,
+        mode=args.status_overlay,
+        ttl_frames=ttl_frames_from_args(args, 0.0),
+        ttl_ms=args.detection_ttl_ms,
+        refresh_mode=args.full_frame_refresh_mode,
+    )
     if not cv2.imwrite(str(output_path), rendered):
         raise RuntimeError(f"Could not write output image: {output_path}")
 
@@ -657,15 +825,15 @@ def run_image(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> Non
     print(f"inference: {elapsed_ms:.2f} ms")
 
 
-def run_camera(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> None:
-    camera = CameraInput(
-        camera_index=args.camera_index,
-        width=args.camera_width,
-        height=args.camera_height,
-        fps=args.camera_fps,
-    )
-    if not camera.is_opened():
-        raise RuntimeError(f"Could not open camera index {args.camera_index}")
+def run_video(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> None:
+    video = cv2.VideoCapture(str(args.video))
+    if not video.isOpened():
+        raise FileNotFoundError(f"Could not open video: {args.video}")
+
+    source_fps = video.get(cv2.CAP_PROP_FPS)
+    output_fps = source_fps if source_fps and source_fps > 0 else 25.0
+    writer: cv2.VideoWriter | None = None
+    output_path = args.output
 
     roi_selector = MotionRoiSelector(
         mode=args.roi_mode,
@@ -681,19 +849,26 @@ def run_camera(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> No
     backend = BackendClient(args.backend_url, timeout=args.backend_timeout, max_queue=args.backend_queue)
     text_renderer = TextRenderer()
     fps_meter = FpsMeter()
-    detection_cache = DetectionCache(ttl_frames=args.detection_ttl_frames, dedupe_iou=args.iou_thres)
+    detection_cache = DetectionCache(
+        ttl_frames=ttl_frames_from_args(args, output_fps),
+        dedupe_iou=args.iou_thres,
+    )
+    refresh_scheduler = RefreshTileScheduler(
+        args.full_frame_refresh_mode,
+        args.full_frame_refresh_ms,
+        args.img_size,
+    )
 
     frame_id = 0
     last_inference_ms = 0.0
     last_face_refresh_time = 0.0
-    last_full_refresh_time = 0.0
 
     if not args.headless:
         print("Press q or Esc to quit.")
 
     try:
         while True:
-            ok, frame = camera.read_frame()
+            ok, frame = video.read()
             if not ok or frame is None:
                 break
 
@@ -701,15 +876,9 @@ def run_camera(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> No
             now = time.perf_counter()
             fps = fps_meter.update()
             roi = roi_selector.select(frame, frame_id)
+            current_ttl_frames = ttl_frames_from_args(args, fps or output_fps)
+            detection_cache.set_ttl_frames(current_ttl_frames)
             active_detections = detection_cache.active_detections(frame_id)
-            full_refresh_due = (
-                args.full_frame_refresh_ms > 0
-                and last_full_refresh_time > 0.0
-                and (now - last_full_refresh_time) * 1000.0 >= args.full_frame_refresh_ms
-            )
-            if full_refresh_due and args.roi_mode == "hybrid":
-                h, w = frame.shape[:2]
-                roi = Roi(0, 0, w, h, "full")
 
             if roi is not None:
                 roi = union_roi_with_detections(
@@ -737,6 +906,8 @@ def run_camera(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> No
                     args.cached_roi_padding_pixels,
                     args.roi_min_size_pixels,
                 )
+            if roi is None and args.roi_mode == "hybrid":
+                roi = refresh_scheduler.next_due_roi(frame.shape[:2], now)
             if roi is not None:
                 roi = expand_roi_to_min_size(roi, frame.shape[:2], args.roi_min_size_pixels)
             skipped = roi is None
@@ -745,7 +916,164 @@ def run_camera(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> No
                 raw_detections, inference_ms = detect_roi(net, frame, roi, args)
                 if roi.reason == "full":
                     detection_cache.update_full(raw_detections, frame_id)
-                    last_full_refresh_time = now
+                elif roi.reason == "tile":
+                    detection_cache.update_region(raw_detections, frame_id, roi)
+                else:
+                    detection_cache.update_motion(raw_detections, frame_id)
+                last_face_refresh_time = now
+                detections, cached_flags = detection_cache.snapshot(frame_id)
+                last_inference_ms = inference_ms
+                payload = build_backend_payload(
+                    args,
+                    frame,
+                    frame_id,
+                    roi,
+                    detections,
+                    labels,
+                    fps,
+                    inference_ms,
+                    cached_flags,
+                )
+                backend.submit(payload)
+            else:
+                detections, _cached_flags = detection_cache.snapshot(frame_id)
+                inference_ms = last_inference_ms
+
+            rendered = draw_detections(frame, detections, labels, text_renderer)
+            rendered = draw_status(
+                rendered,
+                text_renderer,
+                fps,
+                inference_ms,
+                roi,
+                detections,
+                skipped=skipped,
+                mode=args.status_overlay,
+                ttl_frames=current_ttl_frames,
+                ttl_ms=args.detection_ttl_ms,
+                refresh_mode=args.full_frame_refresh_mode,
+            )
+
+            if output_path is not None:
+                if writer is None:
+                    h, w = rendered.shape[:2]
+                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                    writer = cv2.VideoWriter(str(output_path), fourcc, output_fps, (w, h))
+                    if not writer.isOpened():
+                        raise RuntimeError(f"Could not write output video: {output_path}")
+                writer.write(rendered)
+
+            if args.headless:
+                continue
+
+            cv2.imshow("ncnn yolov5 video", rendered)
+            key = cv2.waitKey(1) & 0xFF
+            if key in (27, ord("q")):
+                break
+    finally:
+        backend.close()
+        video.release()
+        if writer is not None:
+            writer.release()
+        if not args.headless:
+            cv2.destroyAllWindows()
+
+    print(f"video: {args.video}")
+    if output_path is not None:
+        print(f"output: {output_path}")
+    print(f"frames: {frame_id}")
+
+
+def run_camera(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> None:
+    camera = CameraInput(
+        camera_index=args.camera_index,
+        width=args.camera_width,
+        height=args.camera_height,
+        fps=args.camera_fps,
+    )
+    if not camera.is_opened():
+        raise RuntimeError(f"Could not open camera index {args.camera_index}")
+
+    roi_selector = MotionRoiSelector(
+        mode=args.roi_mode,
+        full_frame_interval=args.full_frame_interval,
+        min_area=args.roi_min_area,
+        padding=args.roi_padding,
+        padding_pixels=args.roi_padding_pixels,
+        history=args.mog2_history,
+        var_threshold=args.mog2_var_threshold,
+        hold_frames=args.roi_hold_frames,
+        smooth_alpha=args.roi_smooth_alpha,
+    )
+    backend = BackendClient(args.backend_url, timeout=args.backend_timeout, max_queue=args.backend_queue)
+    text_renderer = TextRenderer()
+    fps_meter = FpsMeter()
+    detection_cache = DetectionCache(ttl_frames=ttl_frames_from_args(args, 0.0), dedupe_iou=args.iou_thres)
+    refresh_scheduler = RefreshTileScheduler(
+        args.full_frame_refresh_mode,
+        args.full_frame_refresh_ms,
+        args.img_size,
+    )
+
+    frame_id = 0
+    last_inference_ms = 0.0
+    last_face_refresh_time = 0.0
+
+    if not args.headless:
+        print("Press q or Esc to quit.")
+
+    try:
+        while True:
+            ok, frame = camera.read_frame()
+            if not ok or frame is None:
+                break
+
+            frame_id += 1
+            now = time.perf_counter()
+            fps = fps_meter.update()
+            roi = roi_selector.select(frame, frame_id)
+            current_ttl_frames = ttl_frames_from_args(args, fps)
+            detection_cache.set_ttl_frames(current_ttl_frames)
+            active_detections = detection_cache.active_detections(frame_id)
+
+            if roi is not None:
+                roi = union_roi_with_detections(
+                    roi,
+                    active_detections,
+                    frame.shape[:2],
+                    proximity_pixels=args.roi_padding_pixels,
+                )
+            elif (
+                active_detections.size > 0
+                and (
+                    (
+                        args.face_refresh_ms > 0
+                        and (now - last_face_refresh_time) * 1000.0 >= args.face_refresh_ms
+                    )
+                    or (
+                        args.cached_roi_interval > 0
+                        and frame_id % args.cached_roi_interval == 0
+                    )
+                )
+            ):
+                roi = cached_roi_from_detections(
+                    active_detections,
+                    frame.shape[:2],
+                    args.cached_roi_padding_pixels,
+                    args.roi_min_size_pixels,
+                )
+            if roi is None and args.roi_mode == "hybrid":
+                roi = refresh_scheduler.next_due_roi(frame.shape[:2], now)
+            if roi is not None:
+                roi = expand_roi_to_min_size(roi, frame.shape[:2], args.roi_min_size_pixels)
+            skipped = roi is None
+
+            if roi is not None:
+                raw_detections, inference_ms = detect_roi(net, frame, roi, args)
+                if roi.reason == "full":
+                    detection_cache.update_full(raw_detections, frame_id)
+                elif roi.reason == "tile":
+                    detection_cache.update_region(raw_detections, frame_id, roi)
                 else:
                     detection_cache.update_motion(raw_detections, frame_id)
                 last_face_refresh_time = now
@@ -779,6 +1107,10 @@ def run_camera(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> No
                 roi,
                 detections,
                 skipped=skipped,
+                mode=args.status_overlay,
+                ttl_frames=current_ttl_frames,
+                ttl_ms=args.detection_ttl_ms,
+                refresh_mode=args.full_frame_refresh_mode,
             )
             cv2.imshow("ncnn yolov5 camera", rendered)
             key = cv2.waitKey(1) & 0xFF
@@ -809,7 +1141,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bin", type=Path, default=ROOT / "best.ncnn.bin")
     parser.add_argument("--labels", type=Path, default=ROOT / "labels.txt")
     parser.add_argument("--image", type=Path, help="Image path for single-image inference.")
-    parser.add_argument("--output", type=Path, help="Output image path.")
+    parser.add_argument("--video", type=Path, help="Video path for file-based inference.")
+    parser.add_argument("--output", type=Path, help="Output image or video path.")
     parser.add_argument("--camera-index", type=int, default=0)
     parser.add_argument("--camera", type=int, dest="camera_index", help=argparse.SUPPRESS)
     parser.add_argument("--camera-width", type=int, default=640)
@@ -826,18 +1159,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--roi-mode", choices=("hybrid", "roi", "full"), default="hybrid")
     parser.add_argument("--full-frame-interval", type=int, default=0)
+    parser.add_argument("--full-frame-refresh-mode", choices=("full", "tiles"), default="tiles")
     parser.add_argument("--full-frame-refresh-ms", type=float, default=2000.0)
     parser.add_argument("--roi-min-area", type=int, default=800)
     parser.add_argument("--roi-min-size-pixels", type=int, default=96)
     parser.add_argument("--roi-padding", type=float, default=0.15)
     parser.add_argument("--roi-padding-pixels", type=int, default=50)
     parser.add_argument("--roi-hold-frames", type=int, default=0)
-    parser.add_argument("--roi-smooth-alpha", type=float, default=0.6)
+    parser.add_argument("--roi-smooth-alpha", type=float, default=0.35)
     parser.add_argument("--face-refresh-ms", type=float, default=500.0)
     parser.add_argument("--cached-roi-interval", type=int, default=0)
     parser.add_argument("--cached-roi-padding-pixels", type=int, default=60)
-    parser.add_argument("--detection-ttl-frames", type=int, default=0)
-    parser.add_argument("--mog2-history", type=int, default=500)
+    parser.add_argument("--detection-ttl-ms", type=float, default=500.0)
+    parser.add_argument("--detection-ttl-frames", type=int)
+    parser.add_argument("--status-overlay", choices=("compact", "full", "off"), default="compact")
+    parser.add_argument("--mog2-history", type=int, default=80)
     parser.add_argument("--mog2-var-threshold", type=float, default=25.0)
     parser.add_argument("--backend-url")
     parser.add_argument("--backend-timeout", type=float, default=1.0)
@@ -848,6 +1184,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    input_modes = sum(bool(value) for value in (args.self_test, args.image is not None, args.video is not None))
+    if input_modes > 1:
+        raise SystemExit("Choose only one input mode: --self-test, --image, or --video.")
+
     labels = read_labels(args.labels)
     net = load_net(args)
 
@@ -855,6 +1195,8 @@ def main() -> None:
         run_self_test(args, net)
     elif args.image is not None:
         run_image(args, net, labels)
+    elif args.video is not None:
+        run_video(args, net, labels)
     else:
         run_camera(args, net, labels)
 

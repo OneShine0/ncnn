@@ -1,45 +1,183 @@
-# Raspberry Pi deployment and backend handoff
+# Raspberry Pi Deployment Tutorial / 树莓派傻瓜式部署教程
 
-## Camera input contract
+这份文档按“先用 Python 跑通”的路线写。目标是让一台干净的 Raspberry Pi OS 可以运行当前 YOLOv5 NCNN 检测程序。C++ NCNN 路线放在最后，作为 `pip install ncnn` 失败或性能不足时的兜底方案。
 
-`camera_input.py` is the only file that should need camera-source changes on
-the Pi. Keep this public interface:
+This guide uses the Python-first route. The goal is to run the detector on a clean Raspberry Pi OS. The C++ NCNN route is kept as a fallback.
 
-```python
-class CameraInput:
-    def read_frame(self) -> tuple[bool, np.ndarray | None]:
-        ...
+## 1. 准备树莓派 / Prepare the Pi
 
-    def release(self) -> None:
-        ...
+建议使用 Raspberry Pi OS 64-bit，并先更新系统：
+
+```bash
+sudo apt update
+sudo apt upgrade -y
 ```
 
-`read_frame()` must return:
+安装基础工具和 OpenCV：
 
-- `ok=True` and a frame when capture succeeds.
-- `ok=False, None` when the stream ends or fails.
-- Frame format: BGR, `uint8`, shape `height x width x 3`.
+```bash
+sudo apt install -y python3 python3-pip python3-venv python3-opencv git v4l-utils
+```
 
-Possible Raspberry Pi implementations:
+检查 Python 和摄像头工具：
 
-- USB camera: keep OpenCV `cv2.VideoCapture(0)`.
-- Raspberry Pi camera module: use Picamera2, then convert RGB to BGR.
-- Monitoring stream: use `cv2.VideoCapture(rtsp_or_http_url)`.
+```bash
+python3 --version
+v4l2-ctl --list-devices
+```
 
-The rest of the detector does not care where the frame came from.
+If `v4l2-ctl` lists your USB camera, the system can see the camera device.
 
-## Backend HTTP contract
+## 2. 拷贝项目文件 / Copy Project Files
 
-Run with:
+从 Windows 或 GitHub 把项目放到树莓派，例如：
+
+```bash
+cd ~
+git clone <你的 GitHub 仓库地址> ncnn
+cd ncnn
+```
+
+如果不用 Git，也可以手动复制这些必要文件：
+
+```text
+best.ncnn.param
+best.ncnn.bin
+labels.txt
+detect_ncnn_yolov5.py
+camera_input.py
+roi_motion.py
+backend_client.py
+requirements.txt
+README.md
+RASPBERRY_PI_DEPLOYMENT.md
+docs/
+```
+
+不要复制这些 Windows 本地目录：
+
+```text
+.venv/
+python_packages/
+__pycache__/
+.tmp/
+.vscode/
+```
+
+`python_packages/` contains Windows-only dependency files and is not suitable for Raspberry Pi.
+
+## 3. 安装 Python 依赖 / Install Python Dependencies
+
+先尝试用户级安装：
+
+```bash
+python3 -m pip install --user ncnn numpy
+```
+
+OpenCV 已通过系统包 `python3-opencv` 安装，一般不需要再 pip 安装 `opencv-python`。
+
+如果系统提示 externally managed environment，可以使用虚拟环境：
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install ncnn numpy
+```
+
+如果使用虚拟环境，后续命令请先运行：
+
+```bash
+source .venv/bin/activate
+```
+
+## 4. 环境自检 / Self Test
+
+进入项目目录：
+
+```bash
+cd ~/ncnn
+```
+
+运行自检：
+
+```bash
+python3 detect_ncnn_yolov5.py --self-test
+```
+
+看到类似输出就说明模型和 Python 环境基本可用：
+
+```text
+environment: ok
+model: best.ncnn.param + best.ncnn.bin
+input: in0, output: out0, size: 320
+blank-image detections: 0
+```
+
+If self-test passes, the NCNN runtime and model files are usable.
+
+## 5. USB 摄像头运行 / Run with USB Camera
+
+先确认摄像头编号，通常是 `/dev/video0`，对应 `--camera-index 0`：
+
+```bash
+v4l2-ctl --list-devices
+```
+
+有桌面环境时可以打开预览窗口：
+
+```bash
+python3 detect_ncnn_yolov5.py --camera-index 0 --camera-width 640 --camera-height 640 --threads 4
+```
+
+无桌面或 SSH 环境请使用 headless：
+
+```bash
+python3 detect_ncnn_yolov5.py \
+  --headless \
+  --camera-index 0 \
+  --camera-width 640 \
+  --camera-height 640 \
+  --threads 4
+```
+
+Headless mode is recommended on Raspberry Pi because GUI preview costs CPU and may fail over SSH.
+
+## 6. Raspberry Pi Camera Module / 树莓派 CSI 摄像头
+
+如果使用树莓派摄像头模块，优先确认系统能看到摄像头：
+
+```bash
+libcamera-hello
+```
+
+当前代码默认使用 OpenCV `VideoCapture`。如果 CSI 摄像头不能通过 `/dev/video0` 打开，需要在 `camera_input.py` 中把读取实现替换为 Picamera2，但保持这个接口不变：
+
+```python
+def read_frame(self) -> tuple[bool, np.ndarray | None]:
+    ...
+```
+
+返回帧必须是 BGR、`uint8`、`height x width x 3`。
+
+For Picamera2, return BGR `uint8` frames and keep the same public methods.
+
+## 7. 后端上报 / Backend Reporting
+
+如果要把检测结果发给后端：
 
 ```bash
 python3 detect_ncnn_yolov5.py \
   --headless \
   --backend-url http://HOST:PORT/api/detections \
-  --device-id pi-camera-01
+  --device-id pi-camera-01 \
+  --camera-index 0 \
+  --camera-width 640 \
+  --camera-height 640 \
+  --threads 4
 ```
 
-The detector sends an HTTP `POST` with JSON. Example:
+后端会收到 HTTP `POST` JSON：
 
 ```json
 {
@@ -47,15 +185,7 @@ The detector sends an HTTP `POST` with JSON. Example:
   "timestamp_ms": 1777890000000,
   "frame_id": 128,
   "image_size": {"width": 640, "height": 640},
-  "roi": {
-    "x1": 112,
-    "y1": 80,
-    "x2": 420,
-    "y2": 380,
-    "width": 308,
-    "height": 300,
-    "reason": "motion"
-  },
+  "roi": {"x1": 112, "y1": 80, "x2": 420, "y2": 380, "width": 308, "height": 300, "reason": "motion"},
   "fps": 18.42,
   "inference_ms": 12.37,
   "detections": [
@@ -70,64 +200,105 @@ The detector sends an HTTP `POST` with JSON. Example:
 }
 ```
 
-Notes for backend developers:
+Any `2xx` backend response is accepted.
 
-- Coordinates are in the original full-frame coordinate system, not ROI-local coordinates.
-- `roi.reason` is usually `motion`, `cached`, or `full`.
-- Overlapping mask-status classes are suppressed with class-agnostic NMS, so one face should produce one detection with the highest-confidence label.
-- `cached=true` means the box comes from the local detection cache and was not freshly detected on the current frame.
-- The client sends only after a model inference runs. Frames skipped because no motion was detected are not posted.
-- A skipped preview frame means the model did not run on the current frame; Windows preview keeps the last detection boxes and displays `Using last detections`.
-- HTTP send happens on a background thread. If the backend is slow, old payloads are dropped in favor of newer ones.
-- Return any `2xx` response; the current client does not require a response body.
+## 8. 推荐参数 / Recommended Pi Parameters
 
-## ROI and speed strategy
-
-The Pi default should be:
+先使用默认参数，只明确写这些：
 
 ```bash
---nms-mode class_agnostic --roi-mode hybrid --full-frame-interval 0 --full-frame-refresh-ms 2000 --roi-min-area 800 --roi-min-size-pixels 96 --roi-padding-pixels 50 --roi-hold-frames 0 --roi-smooth-alpha 0.6 --face-refresh-ms 500 --cached-roi-interval 0 --cached-roi-padding-pixels 60 --mog2-history 500 --mog2-var-threshold 25.0 --detection-ttl-frames 0
+python3 detect_ncnn_yolov5.py \
+  --headless \
+  --camera-index 0 \
+  --camera-width 640 \
+  --camera-height 640 \
+  --threads 4 \
+  --roi-mode hybrid \
+  --full-frame-refresh-mode tiles \
+  --full-frame-refresh-ms 2000 \
+  --roi-padding-pixels 50 \
+  --face-refresh-ms 500 \
+  --detection-ttl-ms 500 \
+  --status-overlay compact
 ```
 
-How it works:
+Default refresh behavior checks five tiles over each refresh cycle: a true 2x2 split of the current frame plus one centered tile. On 640x640 frames the 2x2 tiles are 320x320, and the centered tile is `[160,160,480,480]`. This avoids shrinking the whole frame on every periodic refresh while keeping Raspberry Pi load to at most one inference per frame.
 
-- Class-agnostic NMS and class-agnostic cache matching keep one box per face even when the mask-status class flickers.
-- OpenCV `cv2.createBackgroundSubtractorMOG2()` finds motion with `history=500`, `varThreshold=25`, and `detectShadows=False`.
-- The motion mask is denoised with OpenCV thresholding and ellipse-kernel open/close morphology.
-- OpenCV contours and contour-area filtering remove small motion noise and merge valid motion regions into one ROI.
-- The ROI uses fixed pixel padding by default (`--roi-padding-pixels 50`) and a minimum crop size (`--roi-min-size-pixels 96`), then is resized/letterboxed to `320x320` and sent to NCNN.
-- Frame 1 and every `--full-frame-refresh-ms 2000` milliseconds use full-frame detection; set `--full-frame-interval` above `0` only if you want old frame-count scheduling too.
-- Motion ROI is unioned only with nearby cached detections so unrelated movement does not expand the ROI across the whole frame.
-- If MOG2 misses subtle motion but cached detections exist, `--face-refresh-ms 500` runs a padded cached-face ROI recheck. The older frame-count cached ROI fallback stays disabled by default with `--cached-roi-interval 0`.
-- `--detection-ttl-frames 0` means cached detections do not expire by time.
-- Full-frame detection replaces the whole cache, so it is responsible for clearing ghost boxes.
+调参顺序：
 
-Important limitation:
+- 检测框消失太慢：降低 `--full-frame-refresh-ms`。
+- 人脸被 ROI 裁掉：增大 `--roi-padding-pixels`。
+- 小动作检测不够及时：降低 `--face-refresh-ms`。
+- 光照变化导致误触发：增大 `--roi-min-area` 或 `--mog2-var-threshold`。
+- FPS 不够：保持 `--headless`，尝试 `--threads 2`、`3`、`4` 比较实际效果。
 
-- A ghost box can remain until the next scheduled full-frame detection. Lower `--full-frame-refresh-ms` to clear it faster, or raise it for more speed. Raise `--face-refresh-ms` if cached ROI rechecks cost too much CPU.
+## 9. 常见问题 / Troubleshooting
 
-## Raspberry Pi production advice
+### 找不到 ncnn / `ModuleNotFoundError: No module named 'ncnn'`
 
-- Use `--headless`; OpenCV windows cost CPU and may fail without a desktop session.
-- Capture at `640x640` first. If the camera cannot provide that exact size, OpenCV uses the closest supported size and coordinates follow the actual frame.
-- Use `--threads 4` on a 4-core Pi, then benchmark `2` and `3` if the camera pipeline stutters.
-- Tune `--roi-padding-pixels` first for coverage. Try `40` to `60` when a moving person is clipped at the ROI edge.
-- Tune `--face-refresh-ms` next: lower values are steadier for slight head turns, higher values save CPU.
-- Start with CPU NCNN. Try Vulkan only after the CPU path is stable and your Pi image has working drivers.
-- If FPS is still not enough, the next best upgrades are INT8 quantization and a C++ NCNN implementation with the same JSON contract.
+重新安装：
 
-## C++ fallback path
+```bash
+python3 -m pip install --user ncnn numpy
+```
 
-Install tools:
+如果使用虚拟环境：
+
+```bash
+source .venv/bin/activate
+python -m pip install ncnn numpy
+```
+
+### 摄像头打不开 / Could not open camera index 0
+
+检查设备：
+
+```bash
+v4l2-ctl --list-devices
+ls /dev/video*
+```
+
+尝试其他编号：
+
+```bash
+python3 detect_ncnn_yolov5.py --camera-index 1 --headless
+```
+
+### OpenCV 窗口失败 / GUI preview fails
+
+SSH 或无桌面环境请加：
+
+```bash
+--headless
+```
+
+### FPS 太低 / Low FPS
+
+- 使用 `--headless`。
+- 保持输入尺寸 `640x640`，模型尺寸默认 `320x320`。
+- 优先使用 `--roi-mode hybrid`。
+- 适当增大 `--face-refresh-ms`。
+- 尝试不同 `--threads`。
+
+### pip 没有树莓派 ncnn wheel
+
+如果 `python3 -m pip install ncnn` 找不到适合当前系统和 Python 版本的 wheel，就走下面的 C++ fallback。
+
+## 10. C++ NCNN Fallback
+
+这条路线适合 Python `ncnn` 安装失败，或后续需要更高性能时使用。
+
+安装编译工具：
 
 ```bash
 sudo apt update
 sudo apt install -y build-essential git cmake libopencv-dev
 ```
 
-Build NCNN:
+编译 NCNN：
 
 ```bash
+cd ~
 git clone --depth=1 https://github.com/Tencent/ncnn.git
 cd ncnn
 git submodule update --init
@@ -138,13 +309,13 @@ cmake --build . -j$(nproc)
 sudo cmake --install .
 ```
 
-Keep the same model contract:
+模型约定保持不变：
 
-- Input blob: `in0`
-- Output blob: `out0`
-- Input size: `320x320`
-- Recommended camera capture size: `640x640`
-- Preprocess: BGR to RGB, letterbox with value `114`, normalize by `1/255`
-- Output row format: `x, y, w, h, obj, class0, class1, class2`
-- Final score: `obj * class_score`
-- NMS: per class
+```text
+Input blob: in0
+Output blob: out0
+Input size: 320x320
+Preprocess: BGR to RGB, letterbox value 114, normalize by 1/255
+Output row: x, y, w, h, obj, class0, class1, class2
+Final score: obj * class_score
+```

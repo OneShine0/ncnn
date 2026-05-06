@@ -1,159 +1,161 @@
-# YOLOv5 NCNN camera detector
+# YOLOv5 NCNN Camera Detector
 
-This folder runs your exported YOLOv5 NCNN model on a camera stream.
+本项目用于运行导出的 YOLOv5 NCNN 模型，支持图片、视频文件和摄像头实时检测。当前类别用于口罩佩戴状态识别：
 
-Model files:
+- `0`: Correct Wear，绿色框
+- `1`: Wrong Wear，黄色/橙色框
+- `2`: No Wear，红色框
 
-- `best.ncnn.param`
-- `best.ncnn.bin`
+This project runs an exported YOLOv5 NCNN model for image, video-file, and live-camera inference. It detects mask-wearing status with three classes.
 
-Class mapping:
+## 文件结构 / Project Layout
 
-- `0`: Correct Wear, green box
-- `1`: Wrong Wear, yellow/orange box
-- `2`: No Wear, red box
+```text
+best.ncnn.param              # NCNN model structure
+best.ncnn.bin                # NCNN model weights
+labels.txt                   # Class labels
+detect_ncnn_yolov5.py        # Main entry point
+camera_input.py              # Camera source wrapper
+roi_motion.py                # Motion ROI selector
+backend_client.py            # Async backend JSON sender
+requirements.txt             # Python dependency list
+RASPBERRY_PI_DEPLOYMENT.md   # Raspberry Pi beginner tutorial
+docs/                        # Bilingual module notes
+videos/                      # Local test videos, not required on Raspberry Pi
+python_packages/             # Local Windows dependency copy, do not copy to Raspberry Pi
+```
 
-## Windows usage
+`python_packages/` 是 Windows 本机运行时的依赖副本，里面包含 Windows 专用文件，例如 `pywin32`、`win32com` 和 `*-win_amd64.pyd`。它保留在本地使用，并被 `.gitignore` 排除；树莓派部署请按 `RASPBERRY_PI_DEPLOYMENT.md` 安装依赖，不要直接复制这个目录。
 
-Default camera preview:
+`python_packages/` is a local Windows dependency copy. It contains Windows-only files, so keep it local and ignored by Git. Do not copy it to Raspberry Pi.
+
+## Windows 环境 / Windows Setup
+
+在项目目录下运行：
 
 ```powershell
 cd C:\Users\71549\Desktop\ncnn
-python .\detect_ncnn_yolov5.py
+python .\detect_ncnn_yolov5.py --self-test
 ```
 
-The preview shows detection boxes, FPS, inference time, and the current ROI.
-When a frame has no valid motion ROI, inference is skipped and the preview says
-`Using last detections`; in that state no stale ROI box is drawn.
-The camera defaults to `640x640`, while each full-frame or ROI crop is still
-letterboxed to the model input size `320x320`.
-Press `q` or `Esc` to quit.
+如果提示找不到 `ncnn`，可使用当前项目的本地依赖目录，或重新安装：
 
-Environment/model self-test:
+```powershell
+python -m pip install --target .\python_packages ncnn opencv-python numpy
+```
+
+If `ncnn` is missing on Windows, install it into the local package folder shown above.
+
+## 自检 / Self Test
 
 ```powershell
 python .\detect_ncnn_yolov5.py --self-test
 ```
 
-Single image test:
+成功时会打印模型名、输入输出 blob 名、类别和一次空白图推理耗时。
+
+On success, the script prints model names, blob names, labels, and blank-frame inference time.
+
+## 图片检测 / Image Inference
 
 ```powershell
 python .\detect_ncnn_yolov5.py --image .\test.jpg --output .\result.jpg
 ```
 
-Headless mode with backend reporting:
+如果不写 `--output`，程序会在原图同目录生成 `*_ncnn` 后缀的图片。
+
+If `--output` is omitted, the script writes an image with a `*_ncnn` suffix next to the input file.
+
+## 视频检测 / Video Inference
+
+你已经在 `videos/` 文件夹准备了 3 个视频，可以直接运行：
+
+```powershell
+python .\detect_ncnn_yolov5.py --video .\videos\video1.mp4 --output .\videos\video1_detected.mp4
+python .\detect_ncnn_yolov5.py --video .\videos\video2.mp4 --output .\videos\video2_detected.mp4
+python .\detect_ncnn_yolov5.py --video .\videos\video3.mp4 --output .\videos\video3_detected.mp4
+```
+
+不想弹出预览窗口时，加 `--headless`：
+
+```powershell
+python .\detect_ncnn_yolov5.py --video .\videos\video1.mp4 --output .\videos\video1_detected.mp4 --headless
+```
+
+Video mode reads frames from `--video`, draws detections, and writes a rendered video when `--output` is provided. `--headless` disables the preview window.
+
+## 摄像头检测 / Camera Inference
+
+默认打开 0 号摄像头：
+
+```powershell
+python .\detect_ncnn_yolov5.py
+```
+
+后台运行并上报后端：
 
 ```powershell
 python .\detect_ncnn_yolov5.py --headless --backend-url http://HOST:PORT/api/detections --device-id win-camera-01
 ```
 
-## Important options
+Default mode opens camera index `0`. Use `--headless` for no preview window and `--backend-url` to post JSON detections.
+
+## 常用参数 / Useful Options
 
 ```text
+--param best.ncnn.param
+--bin best.ncnn.bin
+--labels labels.txt
+--image path
+--video path
+--output path
 --camera-index 0
 --camera-width 640
 --camera-height 640
 --camera-fps 30
+--headless
 --img-size 320
 --conf-thres 0.25
 --iou-thres 0.45
 --nms-mode class_agnostic
 --threads 4
 --roi-mode hybrid
---full-frame-interval 0
+--full-frame-refresh-mode tiles
 --full-frame-refresh-ms 2000
 --roi-min-area 800
 --roi-min-size-pixels 96
---roi-padding 0.15
 --roi-padding-pixels 50
---roi-hold-frames 0
---roi-smooth-alpha 0.6
 --face-refresh-ms 500
---cached-roi-interval 0
---cached-roi-padding-pixels 60
---mog2-history 500
---mog2-var-threshold 25.0
---detection-ttl-frames 0
+--detection-ttl-ms 500
+--mog2-history 80
+--status-overlay compact
 --backend-url http://HOST:PORT/api/detections
 --device-id pi-camera-01
 ```
 
-ROI modes:
+## ROI 策略 / ROI Strategy
 
-- `hybrid`: default. Run full-frame detection on frame 1, on the time refresh, or on `--full-frame-interval` if it is greater than `0`; otherwise use OpenCV MOG2 motion ROI.
-- `roi`: run full-frame detection on frame 1, then only run OpenCV MOG2 motion ROI.
-- `full`: run full-frame detection every frame. Most stable, slowest.
+- `hybrid`：默认。第一帧和定时刷新做全图检测，其余时间优先使用运动 ROI 和缓存人脸 ROI。
+- `roi`：第一帧全图，之后主要依赖运动 ROI。
+- `full`：每帧全图检测，最稳定但最慢。
 
-`--nms-mode class_agnostic` is the default for mask-wearing detection. It keeps
-one highest-confidence result when the same face overlaps across `Correct Wear`,
-`Wrong Wear`, and `No Wear`, which prevents one face from showing multiple
-boxes because its class score flickers.
+The default `hybrid` mode balances stability and speed. It uses motion ROIs, cached-face rechecks, and time-sliced refresh tiles: a true 2x2 split of the current frame plus one centered tile across each `--full-frame-refresh-ms` cycle. On 640x640 frames the 2x2 tiles are 320x320, and the centered tile is `[160,160,480,480]`. Cached boxes expire after `--detection-ttl-ms` by default, and `--status-overlay compact` uses a vertical semi-transparent test panel.
 
-The motion ROI is based on `cv2.createBackgroundSubtractorMOG2()`. Defaults are
-aligned with the Raspberry Pi reference script: `history=500`,
-`varThreshold=25`, and `detectShadows=False`. OpenCV thresholding,
-ellipse-kernel open/close morphology, and contour area filtering create one
-merged ROI for inference. The lower threshold and smaller default contour area
-make small face turns easier to catch.
+## 树莓派快速入口 / Raspberry Pi Quick Link
 
-Motion ROI detections update a small detection cache instead of replacing the
-whole frame result. This prevents a hand-only ROI from clearing a stable face
-box. Cache matching is class-agnostic, so a face that changes from `Correct
-Wear` to `Wrong Wear` updates the same track instead of creating a second box.
-If MOG2 reports no motion but cached detections exist, the detector runs a
-padded cached-face ROI recheck about every `--face-refresh-ms` milliseconds.
-The older `--cached-roi-interval` frame-based fallback is still available for
-compatibility and stays disabled by default with `--cached-roi-interval 0`. Ghost boxes
-are cleared by the periodic full-frame refresh, because a full-frame inference
-replaces the whole detection cache. `--detection-ttl-frames 0` means there is no
-time-based expiry.
+树莓派新手部署请看：
 
-## Raspberry Pi quick start
+[RASPBERRY_PI_DEPLOYMENT.md](RASPBERRY_PI_DEPLOYMENT.md)
 
-Copy these files to the Pi:
+Beginner-friendly Raspberry Pi deployment is documented in the file above.
 
-```text
-best.ncnn.param
-best.ncnn.bin
-detect_ncnn_yolov5.py
-camera_input.py
-roi_motion.py
-backend_client.py
-labels.txt
-requirements.txt
-RASPBERRY_PI_DEPLOYMENT.md
-```
+## 每个 Python 文件的说明 / Module Documentation
 
-Install dependencies:
+- [detect_ncnn_yolov5.py](docs/detect_ncnn_yolov5.md)
+- [camera_input.py](docs/camera_input.md)
+- [roi_motion.py](docs/roi_motion.md)
+- [backend_client.py](docs/backend_client.md)
 
-```bash
-sudo apt update
-sudo apt install -y python3-pip python3-opencv
-python3 -m pip install --user ncnn numpy
-```
+每份文档都包含中文和英文说明，介绍模块职责、主要类/函数、输入输出和移植注意事项。
 
-Run without display and post detections:
-
-```bash
-python3 detect_ncnn_yolov5.py \
-  --headless \
-  --backend-url http://HOST:PORT/api/detections \
-  --device-id pi-camera-01 \
-  --camera-width 640 \
-  --camera-height 640 \
-  --threads 4
-```
-
-If `pip install ncnn` has no wheel for your Pi OS/Python version, use the C++
-production route from the deployment document.
-
-## Performance notes
-
-- Keep `--headless` enabled on the Pi.
-- Capture at a modest square resolution such as `640x640`; the model input remains `320x320`.
-- Start with the default `--roi-mode hybrid`; lower `--full-frame-refresh-ms` to clear ghost boxes faster, or raise it for more speed.
-- Raise `--roi-min-area` if small lighting changes trigger too many ROIs.
-- Tune `--roi-padding-pixels` first when adjusting ROI coverage; use `40` to `60` if fast movement clips the person.
-- Raise `--face-refresh-ms` for more speed, or lower it if a still face updates too slowly.
-- Keep `--full-frame-interval 0` unless you specifically want old FPS-dependent full-frame scheduling.
-- If Python is still too slow, migrate the same preprocessing, ROI, and JSON contract to C++ NCNN.
+Each document includes Chinese and English notes about responsibilities, key classes/functions, inputs/outputs, and porting notes.
