@@ -18,6 +18,7 @@ detect_ncnn_yolov5.py        # Main entry point
 camera_input.py              # Camera source wrapper
 roi_motion.py                # Motion ROI selector
 backend_client.py            # Async backend JSON sender
+raw_stream.py                # Raw MJPEG stream server for backend preview
 requirements.txt             # Python dependency list
 RASPBERRY_PI_DEPLOYMENT.md   # Raspberry Pi beginner tutorial
 docs/                        # Bilingual module notes
@@ -100,6 +101,31 @@ python .\detect_ncnn_yolov5.py --headless --backend-url http://HOST:PORT/api/det
 
 Default mode opens camera index `0`. Use `--headless` for no preview window and `--backend-url` to post JSON detections.
 
+## PC 后端实时预览 / PC Backend Live Preview
+
+当前推荐链路是：树莓派运行 `mjpg-streamer` 输出原始 MJPEG，PC 检测端读取这个网络流做 NCNN 检测，并把 JSON 上报给本机后端：
+
+```powershell
+python .\detect_ncnn_yolov5.py `
+  --stream-url "http://172.20.10.2:8080/?action=stream" `
+  --backend-url http://127.0.0.1:8000/api/detections `
+  --device-id pi-camera-01
+```
+
+后端设备配置：
+
+```text
+pi-camera-01 -> http://172.20.10.2:8080/?action=stream
+```
+
+如果你的 `mjpg-streamer` 首页地址本身就是裸流，也可以把 `--stream-url` 和后端配置写成：
+
+```text
+http://172.20.10.2:8080/
+```
+
+视频帧不进入 JSON。后端使用 `mjpg-streamer` 原始 MJPEG + 最新 JSON 近实时叠加，完整需求见 [docs/backend_requirements.md](docs/backend_requirements.md)。项目内的 `--raw-stream` 是备用方案：没有外部推流程序时，检测端才需要自己提供原始 MJPEG。`mjpg-streamer` 通常更流畅，是因为它能直接利用摄像头原生 MJPEG、减少重复 JPEG 编码和图像拷贝，并由专用 C 程序负责推流。
+
 ## 常用参数 / Useful Options
 
 ```text
@@ -108,6 +134,7 @@ Default mode opens camera index `0`. Use `--headless` for no preview window and 
 --labels labels.txt
 --image path
 --video path
+--stream-url http://172.20.10.2:8080/?action=stream
 --output path
 --camera-index 0
 --camera-width 640
@@ -121,20 +148,27 @@ Default mode opens camera index `0`. Use `--headless` for no preview window and 
 --threads 4
 --roi-mode hybrid
 --full-frame-refresh-mode tiles
---full-frame-refresh-ms 2000
+--full-frame-refresh-ms 1000
 --roi-min-area 800
 --roi-min-size-pixels 96
 --roi-padding-pixels 50
 --roi-smooth-alpha 0.6
 --face-refresh-ms 500
---detection-ttl-ms 500
+--detection-ttl-ms 0
 --show-expired-ttl
 --expired-ttl-display-frames 8
+--motion-source mog2
 --mog2-history 80
 --frame-diff-enabled
 --frame-diff-threshold 12
 --frame-diff-min-area 300
 --frame-diff-alpha 0.08
+--raw-stream
+--raw-stream-host 0.0.0.0
+--raw-stream-port 8090
+--raw-stream-fps 10
+--raw-stream-width 640
+--raw-stream-quality 70
 --status-overlay compact
 --backend-url http://HOST:PORT/api/detections
 --device-id pi-camera-01
@@ -146,7 +180,7 @@ Default mode opens camera index `0`. Use `--headless` for no preview window and 
 - `roi`：第一帧全图，之后主要依赖运动 ROI。
 - `full`：每帧全图检测，最稳定但最慢。
 
-The default `hybrid` mode balances stability and speed. It uses motion ROIs, cached-face rechecks, and time-sliced refresh tiles: the left half, right half, and one centered vertical patch across each `--full-frame-refresh-ms` cycle. On 640x640 frames the centered patch is `[160,0,480,640]`. Non-full ROIs are regional evidence: old boxes whose centers fall inside the checked ROI are cleared first, then the new ROI detections are added. Cached boxes expire after `--detection-ttl-ms` by default; during testing, `--show-expired-ttl` draws a short red dashed `TTL expired` ghost so stale-box removal is visible. `--status-overlay compact` uses a vertical semi-transparent test panel. `--roi-smooth-alpha 0.6` follows the older stable ROI feel; higher values are steadier but trail movement more, while lower values are more responsive but can jitter. Frame-diff motion is enabled by default as a lightweight backup for subtle movement; lower `--frame-diff-threshold` is more sensitive but noisier, and lower `--frame-diff-min-area` catches smaller changes but can false-trigger more easily.
+The default `hybrid` mode balances stability and speed. It uses MOG2 motion ROIs, cached-face rechecks, regional positive/negative evidence, and 1000 ms time-sliced refresh tiles. In tile mode the refresh ROIs are the left half, right half, and one centered vertical patch; on 640x640 frames the centered patch is `[160,0,480,640]`. Non-full ROIs are regional evidence: old boxes whose centers fall inside the checked ROI are cleared first, then the new ROI detections are added. `--detection-ttl-ms 0` disables time-based stale-box expiry by default, so ghost boxes are cleaned by ROI negative evidence instead; set a positive value such as `500` to test TTL expiry and the red dashed `TTL expired` overlay. `--status-overlay compact` uses a vertical semi-transparent test panel. `--motion-source mog2` is the recommended default; use `--motion-source frame_diff` for frame-diff-only testing or `--motion-source both` to merge MOG2 and frame diff. `--roi-smooth-alpha 0.6` follows the older stable ROI feel; higher values are steadier but trail movement more, while lower values are more responsive but can jitter. For frame diff, lower `--frame-diff-threshold` is more sensitive but noisier, and lower `--frame-diff-min-area` catches smaller changes but can false-trigger more easily.
 
 ## 树莓派快速入口 / Raspberry Pi Quick Link
 
@@ -162,6 +196,8 @@ Beginner-friendly Raspberry Pi deployment is documented in the file above.
 - [camera_input.py](docs/camera_input.md)
 - [roi_motion.py](docs/roi_motion.md)
 - [backend_client.py](docs/backend_client.md)
+- [raw_stream.py](docs/raw_stream.md)
+- [backend_requirements.md](docs/backend_requirements.md)
 
 每份文档都包含中文和英文说明，介绍模块职责、主要类/函数、输入输出和移植注意事项。
 

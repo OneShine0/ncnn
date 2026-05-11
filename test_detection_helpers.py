@@ -75,11 +75,112 @@ class DetectionHelperTests(unittest.TestCase):
         self.assertLessEqual(max(widths) - min(widths), 1)
 
     def test_tile_scheduler_spreads_one_cycle_across_tiles(self) -> None:
-        scheduler = detector.RefreshTileScheduler("tiles", interval_ms=2000, tile_size=320)
+        scheduler = detector.RefreshTileScheduler("tiles", interval_ms=1000, tile_size=320)
         self.assertIsNone(scheduler.next_due_roi((640, 640), 10.0))
-        self.assertEqual(scheduler.next_due_roi((640, 640), 12.0), detector.Roi(0, 0, 320, 640, "tile"))
-        self.assertIsNone(scheduler.next_due_roi((640, 640), 12.5))
-        self.assertEqual(scheduler.next_due_roi((640, 640), 12.667), detector.Roi(320, 0, 640, 640, "tile"))
+        self.assertEqual(scheduler.next_due_roi((640, 640), 11.0), detector.Roi(0, 0, 320, 640, "tile"))
+        self.assertIsNone(scheduler.next_due_roi((640, 640), 11.2))
+        self.assertEqual(scheduler.next_due_roi((640, 640), 11.334), detector.Roi(320, 0, 640, 640, "tile"))
+
+    def test_tile_scheduler_zero_interval_disables_refresh(self) -> None:
+        scheduler = detector.RefreshTileScheduler("tiles", interval_ms=0, tile_size=320)
+        self.assertIsNone(scheduler.next_due_roi((640, 640), 10.0))
+        self.assertIsNone(scheduler.next_due_roi((640, 640), 30.0))
+
+    def test_default_args_use_mog2_refresh_tiles_and_disable_ttl(self) -> None:
+        original_argv = sys.argv
+        try:
+            sys.argv = ["detect_ncnn_yolov5.py", "--self-test"]
+            args = detector.parse_args()
+        finally:
+            sys.argv = original_argv
+
+        self.assertEqual(args.motion_source, "mog2")
+        self.assertEqual(args.full_frame_refresh_ms, 1000.0)
+        self.assertEqual(args.detection_ttl_ms, 0.0)
+        self.assertIsNone(args.stream_url)
+        self.assertFalse(args.raw_stream)
+        self.assertEqual(args.raw_stream_host, "0.0.0.0")
+        self.assertEqual(args.raw_stream_port, 8090)
+        self.assertEqual(args.raw_stream_fps, 10.0)
+        self.assertEqual(args.raw_stream_width, 640)
+        self.assertEqual(args.raw_stream_quality, 70)
+        self.assertEqual(detector.ttl_frames_from_args(args, 30.0), 0)
+
+    def test_stream_url_arg_preserves_mjpg_streamer_url(self) -> None:
+        original_argv = sys.argv
+        try:
+            sys.argv = [
+                "detect_ncnn_yolov5.py",
+                "--stream-url",
+                "http://172.20.10.2:8080/?action=stream",
+            ]
+            args = detector.parse_args()
+        finally:
+            sys.argv = original_argv
+
+        self.assertEqual(args.stream_url, "http://172.20.10.2:8080/?action=stream")
+        self.assertIsNone(args.video)
+        self.assertIsNone(args.image)
+
+    def test_stream_url_is_mutually_exclusive_with_other_input_modes(self) -> None:
+        original_argv = sys.argv
+        try:
+            sys.argv = [
+                "detect_ncnn_yolov5.py",
+                "--stream-url",
+                "http://172.20.10.2:8080/?action=stream",
+                "--video",
+                "sample.mp4",
+            ]
+            with self.assertRaises(SystemExit):
+                detector.main()
+        finally:
+            sys.argv = original_argv
+
+    def test_raw_frame_hub_starts_empty(self) -> None:
+        hub = detector.RawFrameHub()
+        self.assertIsNone(hub.snapshot())
+
+    def test_raw_frame_hub_encodes_jpeg(self) -> None:
+        hub = detector.RawFrameHub(fps=10, width=0, quality=80)
+        frame = np.zeros((32, 48, 3), dtype=np.uint8)
+
+        self.assertTrue(hub.update(frame, now=10.0))
+        jpeg = hub.snapshot()
+
+        self.assertIsNotNone(jpeg)
+        assert jpeg is not None
+        self.assertTrue(jpeg.startswith(b"\xff\xd8"))
+        self.assertTrue(jpeg.endswith(b"\xff\xd9"))
+
+    def test_raw_frame_hub_limits_fps(self) -> None:
+        hub = detector.RawFrameHub(fps=10, width=0, quality=80)
+        frame = np.zeros((32, 48, 3), dtype=np.uint8)
+
+        self.assertTrue(hub.update(frame, now=10.0))
+        self.assertFalse(hub.update(frame, now=10.05))
+        self.assertTrue(hub.update(frame, now=10.11))
+
+    def test_raw_frame_hub_resizes_by_width(self) -> None:
+        hub = detector.RawFrameHub(fps=0, width=60, quality=80)
+        frame = np.zeros((80, 120, 3), dtype=np.uint8)
+
+        self.assertTrue(hub.update(frame, now=10.0))
+        jpeg = hub.snapshot()
+        assert jpeg is not None
+        decoded = detector.cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), detector.cv2.IMREAD_COLOR)
+
+        self.assertEqual(decoded.shape[:2], (40, 60))
+
+    def test_raw_frame_hub_does_not_modify_input_frame(self) -> None:
+        hub = detector.RawFrameHub(fps=0, width=16, quality=80)
+        frame = np.zeros((32, 48, 3), dtype=np.uint8)
+        frame[4:8, 5:9] = (10, 20, 30)
+        original = frame.copy()
+
+        self.assertTrue(hub.update(frame, now=10.0))
+
+        self.assertTrue(np.array_equal(frame, original))
 
     def test_ttl_ms_uses_runtime_fps_unless_frames_are_explicit(self) -> None:
         args = argparse.Namespace(detection_ttl_frames=None, detection_ttl_ms=500.0, camera_fps=None)
@@ -194,6 +295,7 @@ class DetectionHelperTests(unittest.TestCase):
             mode="roi",
             min_area=10_000,
             padding_pixels=0,
+            motion_source="frame_diff",
             frame_diff_enabled=True,
             frame_diff_threshold=12,
             frame_diff_min_area=20,
@@ -220,6 +322,7 @@ class DetectionHelperTests(unittest.TestCase):
             mode="roi",
             min_area=10_000,
             padding_pixels=0,
+            motion_source="frame_diff",
             frame_diff_enabled=True,
             frame_diff_threshold=12,
             frame_diff_min_area=200,
@@ -232,6 +335,63 @@ class DetectionHelperTests(unittest.TestCase):
 
         self.assertIsNone(selector._motion_roi(first))
         self.assertIsNone(selector._motion_roi(second))
+
+    def test_frame_diff_source_ignores_mog2(self) -> None:
+        class FakeSubtractor:
+            def apply(self, _frame: np.ndarray) -> np.ndarray:
+                mask = np.zeros((80, 80), dtype=np.uint8)
+                mask[10:70, 10:70] = 255
+                return mask
+
+        selector = detector.MotionRoiSelector(
+            mode="roi",
+            min_area=20,
+            padding_pixels=0,
+            motion_source="frame_diff",
+            frame_diff_enabled=False,
+            smooth_alpha=0.0,
+        )
+        selector._subtractor = FakeSubtractor()
+
+        frame = np.zeros((80, 80, 3), dtype=np.uint8)
+        self.assertIsNone(selector._motion_roi(frame))
+
+    def test_both_motion_source_merges_mog2_and_frame_diff(self) -> None:
+        class FakeSubtractor:
+            def apply(self, _frame: np.ndarray) -> np.ndarray:
+                mask = np.zeros((80, 80), dtype=np.uint8)
+                mask[5:18, 5:18] = 255
+                return mask
+
+        selector = detector.MotionRoiSelector(
+            mode="roi",
+            min_area=20,
+            padding_pixels=0,
+            motion_source="both",
+            frame_diff_enabled=True,
+            frame_diff_threshold=12,
+            frame_diff_min_area=20,
+            frame_diff_alpha=0.0,
+            smooth_alpha=0.0,
+        )
+        selector._subtractor = FakeSubtractor()
+        first = np.zeros((80, 80, 3), dtype=np.uint8)
+        second = first.copy()
+        second[50:62, 50:62] = 255
+
+        selector._motion_roi(first)
+        roi = selector._motion_roi(second)
+
+        self.assertIsNotNone(roi)
+        assert roi is not None
+        self.assertLessEqual(roi.x1, 5)
+        self.assertLessEqual(roi.y1, 5)
+        self.assertGreaterEqual(roi.x2, 62)
+        self.assertGreaterEqual(roi.y2, 62)
+
+    def test_invalid_motion_source_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            detector.MotionRoiSelector(motion_source="invalid")
 
     def test_status_overlay_modes_are_callable(self) -> None:
         frame = np.zeros((240, 320, 3), dtype=np.uint8)

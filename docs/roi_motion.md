@@ -46,16 +46,16 @@
 ### Key Classes
 
 - `Roi`: Immutable rectangle data object.
-- `MotionRoiSelector`: Selects full-frame or motion-based ROIs using OpenCV MOG2 plus a lightweight frame-diff backup.
+- `MotionRoiSelector`: Selects full-frame or motion-based ROIs using OpenCV MOG2 by default, with frame diff still available by command-line switch.
 
 ### Key Methods
 
 - `Roi.crop(frame)`: Crops the ROI from a frame.
 - `Roi.to_dict()`: Converts ROI data to the backend JSON shape.
 - `MotionRoiSelector.select(frame, frame_id)`: Returns a full-frame ROI, motion ROI, held ROI, or `None`.
-- `_motion_roi(frame)`: Builds a motion mask with MOG2 and frame-diff boxes, then applies thresholding, morphology, and contour filtering.
+- `_motion_roi(frame)`: Builds motion boxes from `--motion-source frame_diff`, `mog2`, or `both`, then applies padding and ROI validation.
 - `_stabilize_motion_roi(...)`: Smooths ROI movement across frames.
 
 ### Tuning
 
-Increase `--roi-min-area` for noisy scenes, increase `--roi-padding-pixels` if targets are clipped, lower `--face-refresh-ms` for steadier still-face updates, and lower `--detection-ttl-ms` if stale boxes linger. Non-full ROI results are regional positive and negative evidence: old boxes centered inside a checked ROI are cleared if the model does not detect them again. The default `--show-expired-ttl` briefly draws TTL-pruned boxes as red dashed local-only ghosts for testing. The default `--mog2-history 80` adapts much faster than the older 500-frame background window; if still faces disappear too easily, try 100 or 120. The default `--roi-smooth-alpha 0.6` keeps the older stable ROI feel: higher values are steadier but trail movement more, while lower values react faster but can jitter. Frame-diff motion is enabled by default as a backup for subtle movement: lower `--frame-diff-threshold` is more sensitive but noisier, lower `--frame-diff-min-area` catches smaller changes but can false-trigger, and `--frame-diff-alpha` controls how quickly the reference image adapts. Periodic refresh defaults to `--full-frame-refresh-mode tiles` so the model checks the left half, right half, and one centered vertical patch instead of shrinking the whole frame. Discuss the expected effect before changing MOG2/ROI defaults.
+Increase `--roi-padding-pixels` if targets are clipped, lower `--face-refresh-ms` for steadier still-face updates, and set a positive `--detection-ttl-ms` only when you want time-based expiry diagnostics. Non-full ROI results are regional positive and negative evidence: old boxes centered inside a checked ROI are cleared if the model does not detect them again. The recommended default is `--motion-source mog2`; use `--motion-source frame_diff` for frame-diff-only testing, or `--motion-source both` to merge MOG2 and frame diff. The default `--mog2-history 80` and `--mog2-var-threshold 25.0` are retained. The default `--roi-smooth-alpha 0.6` keeps the older stable ROI feel: higher values are steadier but trail movement more, while lower values react faster but can jitter. For frame diff, lower `--frame-diff-threshold` is more sensitive but noisier, lower `--frame-diff-min-area` catches smaller changes but can false-trigger, and `--frame-diff-alpha` controls how quickly the reference image adapts. Periodic refresh tiles are enabled by default with `--full-frame-refresh-ms 1000` to check the left half, right half, and one centered vertical patch as an idle fallback. Discuss the expected effect before changing MOG2/ROI defaults.

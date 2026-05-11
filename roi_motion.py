@@ -49,6 +49,7 @@ class MotionRoiSelector:
         var_threshold: float = 50.0,
         hold_frames: int = 0,
         smooth_alpha: float = 0.6,
+        motion_source: str = "mog2",
         frame_diff_enabled: bool = True,
         frame_diff_threshold: int = 12,
         frame_diff_min_area: int = 300,
@@ -56,6 +57,8 @@ class MotionRoiSelector:
     ) -> None:
         if mode not in {"hybrid", "roi", "full"}:
             raise ValueError(f"Unknown ROI mode: {mode}")
+        if motion_source not in {"frame_diff", "mog2", "both"}:
+            raise ValueError(f"Unknown motion source: {motion_source}")
         self.mode = mode
         self.full_frame_interval = max(0, full_frame_interval)
         self.min_area = max(1, min_area)
@@ -63,6 +66,7 @@ class MotionRoiSelector:
         self.padding_pixels = max(0, int(padding_pixels))
         self.hold_frames = max(0, hold_frames)
         self.smooth_alpha = min(max(smooth_alpha, 0.0), 1.0)
+        self.motion_source = motion_source
         self.frame_diff_enabled = bool(frame_diff_enabled)
         self.frame_diff_threshold = max(1, int(frame_diff_threshold))
         self.frame_diff_min_area = max(1, int(frame_diff_min_area))
@@ -107,19 +111,20 @@ class MotionRoiSelector:
     def _motion_roi(self, frame: np.ndarray) -> Roi | None:
         boxes: list[tuple[int, int, int, int]] = []
 
-        mask = self._subtractor.apply(frame)
-        _, mask = cv2.threshold(mask, 200, 255, cv2.THRESH_BINARY)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._kernel, iterations=1)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._kernel, iterations=1)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for contour in contours:
-            area = float(cv2.contourArea(contour))
-            if area < self.min_area:
-                continue
-            x, y, w, h = cv2.boundingRect(contour)
-            boxes.append((x, y, x + w, y + h))
+        if self.motion_source in {"mog2", "both"}:
+            mask = self._subtractor.apply(frame)
+            _, mask = cv2.threshold(mask, 200, 255, cv2.THRESH_BINARY)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._kernel, iterations=1)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._kernel, iterations=1)
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for contour in contours:
+                area = float(cv2.contourArea(contour))
+                if area < self.min_area:
+                    continue
+                x, y, w, h = cv2.boundingRect(contour)
+                boxes.append((x, y, x + w, y + h))
 
-        if self.frame_diff_enabled:
+        if self.frame_diff_enabled and self.motion_source in {"frame_diff", "both"}:
             boxes.extend(self._frame_diff_boxes(frame))
 
         if not boxes:

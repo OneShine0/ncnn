@@ -48,6 +48,7 @@ detect_ncnn_yolov5.py
 camera_input.py
 roi_motion.py
 backend_client.py
+raw_stream.py
 requirements.txt
 README.md
 RASPBERRY_PI_DEPLOYMENT.md
@@ -202,41 +203,50 @@ python3 detect_ncnn_yolov5.py \
 
 Any `2xx` backend response is accepted.
 
+### 原始视频流给 PC 后端 / Raw Stream for PC Backend
+
+当前推荐让树莓派只运行 `mjpg-streamer` 输出原始 MJPEG，PC 上的检测端读取这个网络流并 POST JSON：
+
+```powershell
+python .\detect_ncnn_yolov5.py `
+  --stream-url "http://172.20.10.2:8080/?action=stream" `
+  --backend-url http://127.0.0.1:8000/api/detections `
+  --device-id pi-camera-01
+```
+
+PC 后端设备配置表中写入：
+
+```text
+pi-camera-01 -> http://172.20.10.2:8080/?action=stream
+```
+
+视频帧不进入 JSON。PC 后端拉取 `mjpg-streamer` 原始 MJPEG，并用最新 JSON 检测框在网页端叠加渲染。完整后端需求见 `docs/backend_requirements.md`。项目内 `--raw-stream` 仅作为备用方案：没有外部推流程序时才由检测端自己提供原始 MJPEG。
+
 ## 8. 推荐参数 / Recommended Pi Parameters
 
-先使用默认参数，只明确写这些：
+PC 检测端读取树莓派 `mjpg-streamer` 时，先使用默认参数，只明确写这些：
 
-```bash
-python3 detect_ncnn_yolov5.py \
-  --headless \
-  --camera-index 0 \
-  --camera-width 640 \
-  --camera-height 640 \
-  --threads 4 \
-  --roi-mode hybrid \
-  --full-frame-refresh-mode tiles \
-  --full-frame-refresh-ms 2000 \
-  --roi-padding-pixels 50 \
-  --roi-smooth-alpha 0.6 \
-  --face-refresh-ms 500 \
-  --detection-ttl-ms 500 \
-  --show-expired-ttl \
-  --expired-ttl-display-frames 8 \
-  --frame-diff-enabled \
-  --frame-diff-threshold 12 \
-  --frame-diff-min-area 300 \
-  --frame-diff-alpha 0.08 \
+```powershell
+python .\detect_ncnn_yolov5.py `
+  --stream-url "http://172.20.10.2:8080/?action=stream" `
+  --backend-url http://127.0.0.1:8000/api/detections `
+  --device-id pi-camera-01 `
+  --threads 4 `
+  --roi-mode hybrid `
+  --full-frame-refresh-mode tiles `
+  --full-frame-refresh-ms 1000 `
+  --motion-source mog2 `
   --status-overlay compact
 ```
 
-Default refresh behavior checks three tiles over each refresh cycle: the left half, the right half, and one centered vertical patch. On 640x640 frames the centered patch is `[160,0,480,640]`. This avoids shrinking the whole frame on every periodic refresh while keeping Raspberry Pi load to at most one inference per frame. Non-full ROI detections are regional evidence: stale boxes inside the checked ROI are removed if they are not detected again. During testing, TTL-expired boxes are briefly drawn as red dashed `TTL expired` ghosts. Frame-diff motion is enabled by default as a lightweight backup for subtle movement; lower threshold values are more sensitive but noisier.
+The recommended default path is Raspberry Pi `mjpg-streamer` + PC NCNN detection + MOG2 + cached ROI + ROI negative evidence + 1000 ms time-sliced refresh tiles. `mjpg-streamer` usually looks smoother than the Python fallback because it can forward camera-native MJPEG with less JPEG re-encoding and copying. In tile mode one cycle checks the left half, the right half, and one centered vertical patch; on 640x640 frames the centered patch is `[160,0,480,640]`. Non-full ROI detections are regional evidence: stale boxes inside the checked ROI are removed if they are not detected again. `--detection-ttl-ms 0` disables time-based stale-box expiry by default, so TTL-expired red dashed ghosts only appear when you manually set a positive TTL such as `--detection-ttl-ms 500`. `--motion-source mog2` is the recommended default; use `--motion-source frame_diff` for frame-diff-only testing or `--motion-source both` to merge both sources.
 
 调参顺序：
 
-- 检测框消失太慢：降低 `--full-frame-refresh-ms`。
+- 周期兜底刷新太频繁：增大 `--full-frame-refresh-ms`，例如 `2000`。
 - 人脸被 ROI 裁掉：增大 `--roi-padding-pixels`。
 - 小动作检测不够及时：降低 `--face-refresh-ms`。
-- 光照变化导致误触发：增大 `--roi-min-area` 或 `--mog2-var-threshold`。
+- 光照变化导致误触发：增大 `--roi-min-area` 或 `--mog2-var-threshold`；如果使用帧差，再调整 `--frame-diff-threshold` 或 `--frame-diff-min-area`。
 - FPS 不够：保持 `--headless`，尝试 `--threads 2`、`3`、`4` 比较实际效果。
 
 ## 9. 常见问题 / Troubleshooting

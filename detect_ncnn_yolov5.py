@@ -21,6 +21,7 @@ import numpy as np
 
 from backend_client import BackendClient
 from camera_input import CameraInput
+from raw_stream import RawFrameHub, RawMjpegServer
 from roi_motion import MotionRoiSelector, Roi
 
 
@@ -906,6 +907,7 @@ def run_video(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> Non
         var_threshold=args.mog2_var_threshold,
         hold_frames=args.roi_hold_frames,
         smooth_alpha=args.roi_smooth_alpha,
+        motion_source=args.motion_source,
         frame_diff_enabled=args.frame_diff_enabled,
         frame_diff_threshold=args.frame_diff_threshold,
         frame_diff_min_area=args.frame_diff_min_area,
@@ -924,6 +926,17 @@ def run_video(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> Non
         args.full_frame_refresh_ms,
         args.img_size,
     )
+    raw_hub: RawFrameHub | None = None
+    raw_server: RawMjpegServer | None = None
+    if args.raw_stream:
+        raw_hub = RawFrameHub(
+            fps=args.raw_stream_fps,
+            width=args.raw_stream_width,
+            quality=args.raw_stream_quality,
+        )
+        raw_server = RawMjpegServer(args.raw_stream_host, args.raw_stream_port, raw_hub)
+        raw_server.start()
+        print(f"raw stream: {raw_server.url}")
 
     frame_id = 0
     last_inference_ms = 0.0
@@ -937,6 +950,8 @@ def run_video(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> Non
             ok, frame = video.read()
             if not ok or frame is None:
                 break
+            if raw_hub is not None:
+                raw_hub.update(frame)
 
             frame_id += 1
             now = time.perf_counter()
@@ -1043,6 +1058,8 @@ def run_video(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> Non
             if key in (27, ord("q")):
                 break
     finally:
+        if raw_server is not None:
+            raw_server.close()
         backend.close()
         video.release()
         if writer is not None:
@@ -1051,6 +1068,193 @@ def run_video(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> Non
             cv2.destroyAllWindows()
 
     print(f"video: {args.video}")
+    if output_path is not None:
+        print(f"output: {output_path}")
+    print(f"frames: {frame_id}")
+
+
+def run_stream(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> None:
+    stream = cv2.VideoCapture(args.stream_url)
+    if not stream.isOpened():
+        raise RuntimeError(f"Could not open stream URL: {args.stream_url}")
+    stream.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    source_fps = stream.get(cv2.CAP_PROP_FPS)
+    output_fps = source_fps if source_fps and source_fps > 0 else 25.0
+    writer: cv2.VideoWriter | None = None
+    output_path = args.output
+
+    roi_selector = MotionRoiSelector(
+        mode=args.roi_mode,
+        full_frame_interval=args.full_frame_interval,
+        min_area=args.roi_min_area,
+        padding=args.roi_padding,
+        padding_pixels=args.roi_padding_pixels,
+        history=args.mog2_history,
+        var_threshold=args.mog2_var_threshold,
+        hold_frames=args.roi_hold_frames,
+        smooth_alpha=args.roi_smooth_alpha,
+        motion_source=args.motion_source,
+        frame_diff_enabled=args.frame_diff_enabled,
+        frame_diff_threshold=args.frame_diff_threshold,
+        frame_diff_min_area=args.frame_diff_min_area,
+        frame_diff_alpha=args.frame_diff_alpha,
+    )
+    backend = BackendClient(args.backend_url, timeout=args.backend_timeout, max_queue=args.backend_queue)
+    text_renderer = TextRenderer()
+    fps_meter = FpsMeter()
+    detection_cache = DetectionCache(
+        ttl_frames=ttl_frames_from_args(args, output_fps),
+        dedupe_iou=args.iou_thres,
+    )
+    expired_overlay = ExpiredDetectionOverlay(args.expired_ttl_display_frames)
+    refresh_scheduler = RefreshTileScheduler(
+        args.full_frame_refresh_mode,
+        args.full_frame_refresh_ms,
+        args.img_size,
+    )
+    raw_hub: RawFrameHub | None = None
+    raw_server: RawMjpegServer | None = None
+    if args.raw_stream:
+        raw_hub = RawFrameHub(
+            fps=args.raw_stream_fps,
+            width=args.raw_stream_width,
+            quality=args.raw_stream_quality,
+        )
+        raw_server = RawMjpegServer(args.raw_stream_host, args.raw_stream_port, raw_hub)
+        raw_server.start()
+        print(f"raw stream: {raw_server.url}")
+
+    frame_id = 0
+    last_inference_ms = 0.0
+    last_face_refresh_time = 0.0
+
+    if not args.headless:
+        print("Press q or Esc to quit.")
+
+    try:
+        while True:
+            ok, frame = stream.read()
+            if not ok or frame is None:
+                break
+            if raw_hub is not None:
+                raw_hub.update(frame)
+
+            frame_id += 1
+            now = time.perf_counter()
+            fps = fps_meter.update()
+            roi = roi_selector.select(frame, frame_id)
+            current_ttl_frames = ttl_frames_from_args(args, fps or output_fps)
+            detection_cache.set_ttl_frames(current_ttl_frames)
+            active_detections = detection_cache.active_detections(frame_id)
+
+            if roi is not None:
+                roi = union_roi_with_detections(
+                    roi,
+                    active_detections,
+                    frame.shape[:2],
+                    proximity_pixels=args.roi_padding_pixels,
+                )
+            elif (
+                active_detections.size > 0
+                and (
+                    (
+                        args.face_refresh_ms > 0
+                        and (now - last_face_refresh_time) * 1000.0 >= args.face_refresh_ms
+                    )
+                    or (
+                        args.cached_roi_interval > 0
+                        and frame_id % args.cached_roi_interval == 0
+                    )
+                )
+            ):
+                roi = cached_roi_from_detections(
+                    active_detections,
+                    frame.shape[:2],
+                    args.cached_roi_padding_pixels,
+                    args.roi_min_size_pixels,
+                )
+            if roi is None and args.roi_mode == "hybrid":
+                roi = refresh_scheduler.next_due_roi(frame.shape[:2], now)
+            if roi is not None:
+                roi = expand_roi_to_min_size(roi, frame.shape[:2], args.roi_min_size_pixels)
+            skipped = roi is None
+
+            if roi is not None:
+                raw_detections, inference_ms = detect_roi(net, frame, roi, args)
+                if roi.reason == "full":
+                    detection_cache.update_full(raw_detections, frame_id)
+                else:
+                    detection_cache.update_region(raw_detections, frame_id, roi)
+                last_face_refresh_time = now
+                detections, cached_flags = detection_cache.snapshot(frame_id)
+                last_inference_ms = inference_ms
+                payload = build_backend_payload(
+                    args,
+                    frame,
+                    frame_id,
+                    roi,
+                    detections,
+                    labels,
+                    fps,
+                    inference_ms,
+                    cached_flags,
+                )
+                backend.submit(payload)
+            else:
+                detections, _cached_flags = detection_cache.snapshot(frame_id)
+                inference_ms = last_inference_ms
+
+            if args.show_expired_ttl:
+                expired_overlay.add_tracks(detection_cache.pop_expired_tracks(), frame_id)
+                expired_detections = expired_overlay.snapshot(frame_id)
+            else:
+                detection_cache.pop_expired_tracks()
+                expired_detections = np.empty((0, 6), dtype=np.float32)
+
+            rendered = draw_detections(frame, detections, labels, text_renderer)
+            rendered = draw_expired_detections(rendered, expired_detections, text_renderer)
+            rendered = draw_status(
+                rendered,
+                text_renderer,
+                fps,
+                inference_ms,
+                roi,
+                detections,
+                skipped=skipped,
+                mode=args.status_overlay,
+                ttl_frames=current_ttl_frames,
+                ttl_ms=args.detection_ttl_ms,
+                refresh_mode=args.full_frame_refresh_mode,
+            )
+
+            if output_path is not None:
+                if writer is None:
+                    h, w = rendered.shape[:2]
+                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                    writer = cv2.VideoWriter(str(output_path), fourcc, output_fps, (w, h))
+                    if not writer.isOpened():
+                        raise RuntimeError(f"Could not write output video: {output_path}")
+                writer.write(rendered)
+
+            if args.headless:
+                continue
+
+            cv2.imshow("ncnn yolov5 stream", rendered)
+            key = cv2.waitKey(1) & 0xFF
+            if key in (27, ord("q")):
+                break
+    finally:
+        if raw_server is not None:
+            raw_server.close()
+        backend.close()
+        stream.release()
+        if writer is not None:
+            writer.release()
+        if not args.headless:
+            cv2.destroyAllWindows()
+
+    print(f"stream: {args.stream_url}")
     if output_path is not None:
         print(f"output: {output_path}")
     print(f"frames: {frame_id}")
@@ -1076,6 +1280,7 @@ def run_camera(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> No
         var_threshold=args.mog2_var_threshold,
         hold_frames=args.roi_hold_frames,
         smooth_alpha=args.roi_smooth_alpha,
+        motion_source=args.motion_source,
         frame_diff_enabled=args.frame_diff_enabled,
         frame_diff_threshold=args.frame_diff_threshold,
         frame_diff_min_area=args.frame_diff_min_area,
@@ -1091,6 +1296,17 @@ def run_camera(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> No
         args.full_frame_refresh_ms,
         args.img_size,
     )
+    raw_hub: RawFrameHub | None = None
+    raw_server: RawMjpegServer | None = None
+    if args.raw_stream:
+        raw_hub = RawFrameHub(
+            fps=args.raw_stream_fps,
+            width=args.raw_stream_width,
+            quality=args.raw_stream_quality,
+        )
+        raw_server = RawMjpegServer(args.raw_stream_host, args.raw_stream_port, raw_hub)
+        raw_server.start()
+        print(f"raw stream: {raw_server.url}")
 
     frame_id = 0
     last_inference_ms = 0.0
@@ -1104,6 +1320,8 @@ def run_camera(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> No
             ok, frame = camera.read_frame()
             if not ok or frame is None:
                 break
+            if raw_hub is not None:
+                raw_hub.update(frame)
 
             frame_id += 1
             now = time.perf_counter()
@@ -1200,6 +1418,8 @@ def run_camera(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> No
             if key in (27, ord("q")):
                 break
     finally:
+        if raw_server is not None:
+            raw_server.close()
         backend.close()
         camera.release()
         if not args.headless:
@@ -1225,6 +1445,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--labels", type=Path, default=ROOT / "labels.txt")
     parser.add_argument("--image", type=Path, help="Image path for single-image inference.")
     parser.add_argument("--video", type=Path, help="Video path for file-based inference.")
+    parser.add_argument("--stream-url", help="Network video stream URL, for example an mjpg-streamer URL.")
     parser.add_argument("--output", type=Path, help="Output image or video path.")
     parser.add_argument("--camera-index", type=int, default=0)
     parser.add_argument("--camera", type=int, dest="camera_index", help=argparse.SUPPRESS)
@@ -1243,7 +1464,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--roi-mode", choices=("hybrid", "roi", "full"), default="hybrid")
     parser.add_argument("--full-frame-interval", type=int, default=0)
     parser.add_argument("--full-frame-refresh-mode", choices=("full", "tiles"), default="tiles")
-    parser.add_argument("--full-frame-refresh-ms", type=float, default=2000.0)
+    parser.add_argument("--full-frame-refresh-ms", type=float, default=1000.0)
     parser.add_argument("--roi-min-area", type=int, default=800)
     parser.add_argument("--roi-min-size-pixels", type=int, default=96)
     parser.add_argument("--roi-padding", type=float, default=0.15)
@@ -1253,17 +1474,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--face-refresh-ms", type=float, default=500.0)
     parser.add_argument("--cached-roi-interval", type=int, default=0)
     parser.add_argument("--cached-roi-padding-pixels", type=int, default=60)
-    parser.add_argument("--detection-ttl-ms", type=float, default=500.0)
+    parser.add_argument("--detection-ttl-ms", type=float, default=0.0)
     parser.add_argument("--detection-ttl-frames", type=int)
     parser.add_argument("--show-expired-ttl", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--expired-ttl-display-frames", type=int, default=8)
     parser.add_argument("--status-overlay", choices=("compact", "full", "off"), default="compact")
+    parser.add_argument("--motion-source", choices=("frame_diff", "mog2", "both"), default="mog2")
     parser.add_argument("--mog2-history", type=int, default=80)
     parser.add_argument("--mog2-var-threshold", type=float, default=25.0)
     parser.add_argument("--frame-diff-enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--frame-diff-threshold", type=int, default=12)
     parser.add_argument("--frame-diff-min-area", type=int, default=300)
     parser.add_argument("--frame-diff-alpha", type=float, default=0.08)
+    parser.add_argument("--raw-stream", action="store_true", help="Serve raw MJPEG frames for backend preview.")
+    parser.add_argument("--raw-stream-host", default="0.0.0.0")
+    parser.add_argument("--raw-stream-port", type=int, default=8090)
+    parser.add_argument("--raw-stream-fps", type=float, default=10.0)
+    parser.add_argument("--raw-stream-width", type=int, default=640)
+    parser.add_argument("--raw-stream-quality", type=int, default=70)
     parser.add_argument("--backend-url")
     parser.add_argument("--backend-timeout", type=float, default=1.0)
     parser.add_argument("--backend-queue", type=int, default=8)
@@ -1273,9 +1501,17 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    input_modes = sum(bool(value) for value in (args.self_test, args.image is not None, args.video is not None))
+    input_modes = sum(
+        bool(value)
+        for value in (
+            args.self_test,
+            args.image is not None,
+            args.video is not None,
+            args.stream_url is not None,
+        )
+    )
     if input_modes > 1:
-        raise SystemExit("Choose only one input mode: --self-test, --image, or --video.")
+        raise SystemExit("Choose only one input mode: --self-test, --image, --video, or --stream-url.")
 
     labels = read_labels(args.labels)
     net = load_net(args)
@@ -1286,6 +1522,8 @@ def main() -> None:
         run_image(args, net, labels)
     elif args.video is not None:
         run_video(args, net, labels)
+    elif args.stream_url is not None:
+        run_stream(args, net, labels)
     else:
         run_camera(args, net, labels)
 

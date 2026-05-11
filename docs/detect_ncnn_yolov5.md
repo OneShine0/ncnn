@@ -4,7 +4,7 @@
 
 ### 模块职责
 
-`detect_ncnn_yolov5.py` 是项目主入口，负责加载 YOLOv5 NCNN 模型，读取图片、视频或摄像头画面，完成预处理、推理、后处理、ROI 优化、画框显示和后端上报。
+`detect_ncnn_yolov5.py` 是项目主入口，负责加载 YOLOv5 NCNN 模型，读取图片、视频、摄像头或网络视频流画面，完成预处理、推理、后处理、ROI 优化、画框显示和后端上报。
 
 ### 主要类
 
@@ -33,10 +33,11 @@
 - `draw_label(...)`、`draw_detections(...)`、`draw_status(...)`：绘制标签、检测框和状态面板。
 - `run_image(...)`：图片检测入口。
 - `run_video(...)`：视频文件检测入口，支持预览、`--headless`、可选 `--output` 保存结果视频。
+- `run_stream(...)`：网络视频流检测入口，推荐用于读取树莓派 `mjpg-streamer` 的 MJPEG 输出。
 - `run_camera(...)`：摄像头实时检测入口。
 - `run_self_test(...)`：用空白图像验证模型和环境是否能完成一次推理。
 - `parse_args()`：定义命令行参数。
-- `main()`：根据 `--self-test`、`--image`、`--video` 选择运行模式，默认运行摄像头模式。
+- `main()`：根据 `--self-test`、`--image`、`--video`、`--stream-url` 选择运行模式，默认运行摄像头模式。
 
 ### 输入输出
 
@@ -44,25 +45,26 @@
 - 输入标签：`labels.txt`。
 - 图片输入：`--image path`。
 - 视频输入：`--video path`。
+- 网络流输入：`--stream-url http://172.20.10.2:8080/?action=stream`。
 - 摄像头输入：`--camera-index 0`。
 - 输出图片或视频：`--output path`。
 - 后端输出：`--backend-url http://HOST:PORT/api/detections`。
 
 ### 调用关系
 
-`main()` 先读取参数和标签，再加载 NCNN 模型。图片模式直接执行一次 `detect_roi()`。视频和摄像头模式循环读取帧，先用 `MotionRoiSelector` 选择 ROI，再执行 `detect_roi()`，更新 `DetectionCache`，最后绘制画面并可选发送后端 JSON。
+`main()` 先读取参数和标签，再加载 NCNN 模型。图片模式直接执行一次 `detect_roi()`。视频、网络流和摄像头模式循环读取帧，先用 `MotionRoiSelector` 选择 ROI，再执行 `detect_roi()`，更新 `DetectionCache`，最后绘制画面并可选发送后端 JSON。当前推荐网络流由树莓派 `mjpg-streamer` 提供，检测端只读取流并输出 JSON。
 
 ## English Notes
 
 ### Module Purpose
 
-`detect_ncnn_yolov5.py` is the main entry point. It loads the YOLOv5 NCNN model, reads images, videos, or camera frames, then performs preprocessing, inference, postprocessing, ROI optimization, drawing, preview, and optional backend reporting.
+`detect_ncnn_yolov5.py` is the main entry point. It loads the YOLOv5 NCNN model, reads images, videos, camera frames, or network video streams, then performs preprocessing, inference, postprocessing, ROI optimization, drawing, preview, and optional backend reporting.
 
 ### Key Classes
 
 - `FpsMeter`: Tracks loop FPS with smoothing.
 - `TrackedDetection`: Stores one detection and the last frame where it was refreshed.
-- `DetectionCache`: Keeps stable detections across ROI frames, treats non-full ROI results as regional evidence, expires stale boxes with TTL, and reports TTL-expired boxes for local visualization.
+- `DetectionCache`: Keeps stable detections across ROI frames, treats non-full ROI results as regional evidence, and can expire stale boxes with TTL when TTL is enabled.
 - `RefreshTileScheduler`: Time-slices periodic refreshes across the left half, right half, and one centered vertical patch.
 - `TextRenderer`: Draws labels with PIL fonts when available, with OpenCV text as fallback.
 
@@ -72,15 +74,16 @@
 - `letterbox(image, size)`: Resizes and pads an image to the model input size.
 - `make_input(image, img_size)`: Converts BGR frames to normalized NCNN input.
 - `decode_output(...)`: Converts raw model rows into boxes, scores, class ids, and applies NMS.
-- `refresh_tiles(...)`: Builds the 5-tile refresh layout from the current frame shape.
+- `refresh_tiles(...)`: Builds the optional 3-tile refresh layout from the current frame shape.
 - `load_net(args)`: Loads NCNN model files and configures thread count.
 - `detect(...)`: Runs one full inference on an image.
 - `detect_roi(...)`: Runs inference on a crop and maps boxes back to full-frame coordinates.
 - `run_image(...)`: Handles still-image inference.
 - `run_video(...)`: Handles video-file inference with optional preview, headless mode, output video, and backend reporting.
+- `run_stream(...)`: Handles network video streams, especially Raspberry Pi `mjpg-streamer` MJPEG output.
 - `run_camera(...)`: Handles live camera inference.
 - `run_self_test(...)`: Checks whether the runtime and model can run one blank-frame inference.
-- `main()`: Selects self-test, image, video, or camera mode.
+- `main()`: Selects self-test, image, video, stream URL, or camera mode.
 
 ### Inputs and Outputs
 
@@ -88,10 +91,12 @@
 - Label input: `labels.txt`.
 - Image input: `--image path`.
 - Video input: `--video path`.
+- Network stream input: `--stream-url http://172.20.10.2:8080/?action=stream`.
 - Camera input: `--camera-index 0`.
 - Rendered output: `--output path`.
 - Backend JSON output: `--backend-url http://HOST:PORT/api/detections`.
+- Raw MJPEG output for PC backend rendering: `--raw-stream`.
 
 ### Flow
 
-`main()` parses arguments, loads labels, and loads the NCNN network. Image mode runs a single full-frame inference. Video and camera modes read frames in a loop, prefer motion/cached ROIs, then use time-sliced refresh tiles when idle. Each ROI runs through `detect_roi()`, updates `DetectionCache`, renders results, and optionally submits JSON payloads to the backend.
+`main()` parses arguments, loads labels, and loads the NCNN network. Image mode runs a single full-frame inference. Video, stream, and camera modes read frames in a loop, optionally update the raw MJPEG fallback with the original frame, prefer MOG2 motion and cached ROIs, then use time-sliced refresh tiles when idle. Each ROI runs through `detect_roi()`, updates `DetectionCache`, renders local debug output when needed, and optionally submits JSON payloads to the backend. TTL is disabled by default with `--detection-ttl-ms 0`; stale boxes are primarily cleared by regional negative evidence. The recommended live-preview path uses Raspberry Pi `mjpg-streamer` as the raw video source and keeps the detector focused on inference plus JSON output.
