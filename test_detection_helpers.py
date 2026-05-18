@@ -1,9 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
+import json
+import os
+import socket
 import sys
+import time
 import types
 import unittest
+import urllib.request
 
 import numpy as np
 
@@ -86,7 +93,7 @@ class DetectionHelperTests(unittest.TestCase):
         self.assertIsNone(scheduler.next_due_roi((640, 640), 10.0))
         self.assertIsNone(scheduler.next_due_roi((640, 640), 30.0))
 
-    def test_default_args_use_mog2_refresh_tiles_and_disable_ttl(self) -> None:
+    def test_default_args_use_full_stream_detection_and_disable_ttl(self) -> None:
         original_argv = sys.argv
         try:
             sys.argv = ["detect_ncnn_yolov5.py", "--self-test"]
@@ -95,16 +102,33 @@ class DetectionHelperTests(unittest.TestCase):
             sys.argv = original_argv
 
         self.assertEqual(args.motion_source, "mog2")
-        self.assertEqual(args.full_frame_refresh_ms, 1000.0)
+        self.assertEqual(args.threads, 2)
+        self.assertEqual(args.roi_mode, "full")
+        self.assertEqual(args.img_size, 320)
+        self.assertEqual(args.input_name, "in0")
+        self.assertEqual(args.output_name, "out0")
+        self.assertEqual(args.full_frame_refresh_ms, 0.0)
+        self.assertEqual(args.cached_roi_ms, 0.0)
         self.assertEqual(args.detection_ttl_ms, 0.0)
-        self.assertIsNone(args.stream_url)
-        self.assertFalse(args.raw_stream)
-        self.assertEqual(args.raw_stream_host, "0.0.0.0")
-        self.assertEqual(args.raw_stream_port, 8090)
-        self.assertEqual(args.raw_stream_fps, 10.0)
-        self.assertEqual(args.raw_stream_width, 640)
-        self.assertEqual(args.raw_stream_quality, 70)
+        self.assertEqual(args.stream_url, "http://127.0.0.1:8080/?action=stream")
+        self.assertEqual(args.backend_url, "http://172.20.10.3:5000/api/detections")
+        self.assertTrue(args.latest_json)
+        self.assertEqual(args.latest_json_host, "0.0.0.0")
+        self.assertEqual(args.latest_json_port, 8090)
+        self.assertEqual(args.device_id, "pi-camera-01")
         self.assertEqual(detector.ttl_frames_from_args(args, 30.0), 0)
+
+    def test_default_stream_url_does_not_conflict_with_other_input_modes(self) -> None:
+        original_argv = sys.argv
+        try:
+            sys.argv = ["detect_ncnn_yolov5.py", "--image", "sample.jpg"]
+            args = detector.parse_args()
+        finally:
+            sys.argv = original_argv
+
+        self.assertEqual(args.stream_url, "http://127.0.0.1:8080/?action=stream")
+        self.assertEqual(args.image.name, "sample.jpg")
+        self.assertFalse(detector.cli_option_provided(["--image", "sample.jpg"], "--stream-url"))
 
     def test_stream_url_arg_preserves_mjpg_streamer_url(self) -> None:
         original_argv = sys.argv
@@ -137,57 +161,51 @@ class DetectionHelperTests(unittest.TestCase):
         finally:
             sys.argv = original_argv
 
-    def test_raw_frame_hub_starts_empty(self) -> None:
-        hub = detector.RawFrameHub()
-        self.assertIsNone(hub.snapshot())
-
-    def test_raw_frame_hub_encodes_jpeg(self) -> None:
-        hub = detector.RawFrameHub(fps=10, width=0, quality=80)
-        frame = np.zeros((32, 48, 3), dtype=np.uint8)
-
-        self.assertTrue(hub.update(frame, now=10.0))
-        jpeg = hub.snapshot()
-
-        self.assertIsNotNone(jpeg)
-        assert jpeg is not None
-        self.assertTrue(jpeg.startswith(b"\xff\xd8"))
-        self.assertTrue(jpeg.endswith(b"\xff\xd9"))
-
-    def test_raw_frame_hub_limits_fps(self) -> None:
-        hub = detector.RawFrameHub(fps=10, width=0, quality=80)
-        frame = np.zeros((32, 48, 3), dtype=np.uint8)
-
-        self.assertTrue(hub.update(frame, now=10.0))
-        self.assertFalse(hub.update(frame, now=10.05))
-        self.assertTrue(hub.update(frame, now=10.11))
-
-    def test_raw_frame_hub_resizes_by_width(self) -> None:
-        hub = detector.RawFrameHub(fps=0, width=60, quality=80)
-        frame = np.zeros((80, 120, 3), dtype=np.uint8)
-
-        self.assertTrue(hub.update(frame, now=10.0))
-        jpeg = hub.snapshot()
-        assert jpeg is not None
-        decoded = detector.cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), detector.cv2.IMREAD_COLOR)
-
-        self.assertEqual(decoded.shape[:2], (40, 60))
-
-    def test_raw_frame_hub_does_not_modify_input_frame(self) -> None:
-        hub = detector.RawFrameHub(fps=0, width=16, quality=80)
-        frame = np.zeros((32, 48, 3), dtype=np.uint8)
-        frame[4:8, 5:9] = (10, 20, 30)
-        original = frame.copy()
-
-        self.assertTrue(hub.update(frame, now=10.0))
-
-        self.assertTrue(np.array_equal(frame, original))
+    def test_removed_overlapping_args_are_rejected(self) -> None:
+        removed_args = [
+            "--camera-fps",
+            "--face-refresh-ms",
+            "--full-frame-interval",
+            "--cached-roi-interval",
+            "--raw-stream",
+            "--raw-stream-host",
+            "--raw-stream-port",
+            "--raw-stream-fps",
+            "--raw-stream-width",
+            "--raw-stream-quality",
+            "--camera",
+            "--frame-diff-enabled",
+            "--no-frame-diff-enabled",
+            "--detection-ttl-frames",
+            "--stream-read-fps",
+            "--profile-every",
+        ]
+        original_argv = sys.argv
+        try:
+            for arg in removed_args:
+                with self.subTest(arg=arg):
+                    sys.argv = ["detect_ncnn_yolov5.py", arg, "1"]
+                    with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                        detector.parse_args()
+        finally:
+            sys.argv = original_argv
 
     def test_ttl_ms_uses_runtime_fps_unless_frames_are_explicit(self) -> None:
-        args = argparse.Namespace(detection_ttl_frames=None, detection_ttl_ms=500.0, camera_fps=None)
+        args = argparse.Namespace(detection_ttl_ms=500.0)
         self.assertEqual(detector.ttl_frames_from_args(args, 30.0), 15)
 
-        args.detection_ttl_frames = 0
+        args.detection_ttl_ms = 0.0
         self.assertEqual(detector.ttl_frames_from_args(args, 30.0), 0)
+
+    def test_cached_roi_due_respects_ms_interval(self) -> None:
+        detections = np.array([[20, 20, 60, 60, 0.9, 0]], dtype=np.float32)
+
+        self.assertFalse(detector.cached_roi_due(detections, now=10.0, last_refresh_time=9.8, interval_ms=500))
+        self.assertTrue(detector.cached_roi_due(detections, now=10.31, last_refresh_time=9.8, interval_ms=500))
+        self.assertFalse(detector.cached_roi_due(detections, now=10.31, last_refresh_time=9.8, interval_ms=0))
+        self.assertFalse(
+            detector.cached_roi_due(np.empty((0, 6), dtype=np.float32), now=10.31, last_refresh_time=9.8, interval_ms=500)
+        )
 
     def test_region_update_clears_checked_tile_tracks(self) -> None:
         cache = detector.DetectionCache(ttl_frames=0)
@@ -296,7 +314,6 @@ class DetectionHelperTests(unittest.TestCase):
             min_area=10_000,
             padding_pixels=0,
             motion_source="frame_diff",
-            frame_diff_enabled=True,
             frame_diff_threshold=12,
             frame_diff_min_area=20,
             frame_diff_alpha=0.0,
@@ -323,7 +340,6 @@ class DetectionHelperTests(unittest.TestCase):
             min_area=10_000,
             padding_pixels=0,
             motion_source="frame_diff",
-            frame_diff_enabled=True,
             frame_diff_threshold=12,
             frame_diff_min_area=200,
             frame_diff_alpha=0.0,
@@ -336,25 +352,28 @@ class DetectionHelperTests(unittest.TestCase):
         self.assertIsNone(selector._motion_roi(first))
         self.assertIsNone(selector._motion_roi(second))
 
-    def test_frame_diff_source_ignores_mog2(self) -> None:
+    def test_mog2_source_ignores_frame_diff(self) -> None:
         class FakeSubtractor:
             def apply(self, _frame: np.ndarray) -> np.ndarray:
-                mask = np.zeros((80, 80), dtype=np.uint8)
-                mask[10:70, 10:70] = 255
-                return mask
+                return np.zeros((80, 80), dtype=np.uint8)
 
         selector = detector.MotionRoiSelector(
             mode="roi",
             min_area=20,
             padding_pixels=0,
-            motion_source="frame_diff",
-            frame_diff_enabled=False,
+            motion_source="mog2",
+            frame_diff_threshold=12,
+            frame_diff_min_area=20,
+            frame_diff_alpha=0.0,
             smooth_alpha=0.0,
         )
         selector._subtractor = FakeSubtractor()
 
         frame = np.zeros((80, 80, 3), dtype=np.uint8)
+        changed = frame.copy()
+        changed[30:50, 30:50] = 255
         self.assertIsNone(selector._motion_roi(frame))
+        self.assertIsNone(selector._motion_roi(changed))
 
     def test_both_motion_source_merges_mog2_and_frame_diff(self) -> None:
         class FakeSubtractor:
@@ -368,7 +387,6 @@ class DetectionHelperTests(unittest.TestCase):
             min_area=20,
             padding_pixels=0,
             motion_source="both",
-            frame_diff_enabled=True,
             frame_diff_threshold=12,
             frame_diff_min_area=20,
             frame_diff_alpha=0.0,
@@ -392,6 +410,121 @@ class DetectionHelperTests(unittest.TestCase):
     def test_invalid_motion_source_raises(self) -> None:
         with self.assertRaises(ValueError):
             detector.MotionRoiSelector(motion_source="invalid")
+
+    def test_latest_json_hub_returns_latest_payload(self) -> None:
+        hub = detector.LatestJsonHub("pi-camera-01")
+        initial = json.loads(hub.snapshot_bytes().decode("utf-8"))
+        self.assertEqual(initial["status"], "warming_up")
+        self.assertEqual(initial["device_id"], "pi-camera-01")
+
+        hub.update({"device_id": "pi-camera-01", "frame_id": 7, "detections": [{"class_id": 1}]})
+        latest = json.loads(hub.snapshot_bytes().decode("utf-8"))
+
+        self.assertEqual(latest["frame_id"], 7)
+        self.assertEqual(latest["detections"][0]["class_id"], 1)
+
+    def test_latest_json_server_serves_payload_and_health(self) -> None:
+        hub = detector.LatestJsonHub("pi-camera-01")
+        hub.update({"device_id": "pi-camera-01", "frame_id": 9, "detections": []})
+        server = detector.LatestJsonServer("127.0.0.1", 0, hub)
+        server.start()
+        try:
+            with urllib.request.urlopen(server.url, timeout=2.0) as response:
+                body = json.loads(response.read().decode("utf-8"))
+                headers = response.headers
+            with urllib.request.urlopen(f"http://127.0.0.1:{server.port}/health", timeout=2.0) as response:
+                health = json.loads(response.read().decode("utf-8"))
+        finally:
+            server.close()
+
+        self.assertEqual(body["frame_id"], 9)
+        self.assertEqual(health["status"], "ok")
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(headers["Access-Control-Allow-Origin"], "*")
+
+    def test_websocket_text_frame_encodes_small_payload(self) -> None:
+        self.assertEqual(detector.websocket_text_frame(b"abc"), b"\x81\x03abc")
+
+    def test_latest_json_server_websocket_sends_initial_payload(self) -> None:
+        hub = detector.LatestJsonHub("pi-camera-01")
+        hub.update({"device_id": "pi-camera-01", "frame_id": 11, "detections": []})
+        server = detector.LatestJsonServer("127.0.0.1", 0, hub)
+        server.start()
+        key = base64_key = os.urandom(16)
+        encoded_key = __import__("base64").b64encode(base64_key).decode("ascii")
+        try:
+            sock = socket.create_connection(("127.0.0.1", server.port), timeout=2.0)
+            request = (
+                "GET /ws HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{server.port}\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {encoded_key}\r\n"
+                "Sec-WebSocket-Version: 13\r\n"
+                "\r\n"
+            ).encode("ascii")
+            sock.sendall(request)
+            response = sock.recv(4096)
+            self.assertIn(b"101 Switching Protocols", response)
+            header = sock.recv(2)
+            self.assertEqual(header[0], 0x81)
+            length = header[1] & 0x7F
+            payload = sock.recv(length)
+            body = json.loads(payload.decode("utf-8"))
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+            server.close()
+
+        self.assertEqual(body["frame_id"], 11)
+
+    def test_latest_frame_stream_drops_stale_frames(self) -> None:
+        class FakeCapture:
+            def __init__(self) -> None:
+                self.frames = [
+                    np.full((2, 2, 3), value, dtype=np.uint8)
+                    for value in (1, 2, 3)
+                ]
+                self.released = False
+
+            def set(self, _prop: int, _value: float) -> None:
+                return None
+
+            def get(self, _prop: int) -> float:
+                return 25.0
+
+            def isOpened(self) -> bool:
+                return True
+
+            def read(self) -> tuple[bool, np.ndarray | None]:
+                if self.frames:
+                    return True, self.frames.pop(0)
+                time.sleep(0.01)
+                return False, None
+
+            def release(self) -> None:
+                self.released = True
+
+        capture = FakeCapture()
+        stream = detector.LatestFrameStream("fake://stream", read_timeout=0.5, capture=capture)
+        self.assertTrue(stream.is_opened())
+        stream.start()
+        assert stream._thread is not None
+        stream._thread.join(timeout=1.0)
+
+        ok, frame = stream.read()
+
+        stream.release()
+        self.assertTrue(ok)
+        assert frame is not None
+        self.assertEqual(int(frame[0, 0, 0]), 3)
+        self.assertTrue(capture.released)
+
+        ok, frame = stream.read()
+        self.assertFalse(ok)
+        self.assertIsNone(frame)
 
     def test_status_overlay_modes_are_callable(self) -> None:
         frame = np.zeros((240, 320, 3), dtype=np.uint8)

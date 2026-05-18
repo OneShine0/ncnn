@@ -18,7 +18,6 @@ class CameraInput:
     camera_index: int = 0
     width: int | None = None
     height: int | None = None
-    fps: int | None = None
 
     def __post_init__(self) -> None:
         if os.name == "nt":
@@ -30,8 +29,6 @@ class CameraInput:
             self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
         if self.height:
             self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-        if self.fps:
-            self._cap.set(cv2.CAP_PROP_FPS, self.fps)
 
         self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 

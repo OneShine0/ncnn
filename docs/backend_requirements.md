@@ -13,14 +13,26 @@
 原始视频流由树莓派 `mjpg-streamer` 提供：
 
 ```text
-GET http://172.20.10.2:8080/?action=stream
+GET http://127.0.0.1:8080/?action=stream
 Content-Type: multipart/x-mixed-replace; boundary=frame
+```
+
+妫€娴嬬鍚屾椂鎻愪緵鏈€鏂?JSON 鎷夊彇鎺ュ彛锛?
+```text
+GET http://127.0.0.1:8090/latest.json
+Content-Type: application/json; charset=utf-8
+Cache-Control: no-store
+```
+
+WebSocket push interface:
+```text
+ws://172.20.10.2:8090/ws
 ```
 
 检测 JSON 由 PC 检测端提供：
 
 ```text
-POST http://127.0.0.1:8000/api/detections
+POST http://172.20.10.3:5000/api/detections
 Content-Type: application/json; charset=utf-8
 ```
 
@@ -31,8 +43,7 @@ Content-Type: application/json; charset=utf-8
 PC 后端维护设备配置表：
 
 ```text
-pi-camera-01 -> http://172.20.10.2:8080/?action=stream
-win-camera-01 -> http://127.0.0.1:8090/stream.mjpg
+pi-camera-01 -> http://127.0.0.1:8080/?action=stream
 ```
 
 检测端 JSON 不负责自动注册 `stream_url`。后端按 `device_id` 查配置表。
@@ -143,6 +154,6 @@ win-camera-01 -> http://127.0.0.1:8090/stream.mjpg
 
 ## English Notes
 
-The recommended local-test path is Raspberry Pi `mjpg-streamer` for raw MJPEG, PC-side NCNN detection for JSON posting, and a PC backend for video proxying, latest-state caching, and browser rendering. The detector's built-in `--raw-stream` remains a fallback when no external streamer is available.
+The recommended local-test path is Raspberry Pi `mjpg-streamer` for raw MJPEG, PC-side NCNN detection for JSON posting, and a PC backend for video proxying, latest-state caching, and browser rendering. The detector no longer includes its own MJPEG server.
 
 The backend should keep a `device_id -> stream_url` table, accept `POST /api/detections`, and render the latest JSON over the latest MJPEG frame. Frame-level synchronization is not required; use the latest available detection state.

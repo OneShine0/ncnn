@@ -25,6 +25,7 @@
 - `union_roi_with_detections(...)`：把运动 ROI 与附近缓存人脸框合并，避免 ROI 裁掉目标。
 - `expand_roi_to_min_size(...)`：把过小 ROI 扩展到最低尺寸。
 - `cached_roi_from_detections(...)`：根据已有缓存检测框生成复查 ROI。
+- `cached_roi_due(...)`：判断缓存检测框复查间隔是否到期。
 - `load_net(args)`：加载 `.param` 和 `.bin` 模型文件，设置线程数。
 - `detect(net, image, args)`：对单张图像执行一次完整推理。
 - `detect_roi(net, frame, roi, args)`：裁剪 ROI 后推理，并把检测框坐标映射回原图。
@@ -45,14 +46,14 @@
 - 输入标签：`labels.txt`。
 - 图片输入：`--image path`。
 - 视频输入：`--video path`。
-- 网络流输入：`--stream-url http://172.20.10.2:8080/?action=stream`。
+- 网络流输入：`--stream-url http://127.0.0.1:8080/?action=stream`。
 - 摄像头输入：`--camera-index 0`。
 - 输出图片或视频：`--output path`。
-- 后端输出：`--backend-url http://HOST:PORT/api/detections`。
+- 后端输出：`--backend-url http://172.20.10.3:5000/api/detections`。
 
 ### 调用关系
 
-`main()` 先读取参数和标签，再加载 NCNN 模型。图片模式直接执行一次 `detect_roi()`。视频、网络流和摄像头模式循环读取帧，先用 `MotionRoiSelector` 选择 ROI，再执行 `detect_roi()`，更新 `DetectionCache`，最后绘制画面并可选发送后端 JSON。当前推荐网络流由树莓派 `mjpg-streamer` 提供，检测端只读取流并输出 JSON。
+`main()` 先读取参数和标签，再加载 NCNN 模型。图片模式直接执行一次 `detect_roi()`。视频、网络流和摄像头模式循环读取帧。默认落地路径使用 `--roi-mode full` 和 `--threads 2` 做每帧全图 NCNN 检测；实测在当前树莓派上比 MOG2 ROI 更快更稳定。`hybrid` 和 `roi` 模式仍保留用于实验：可使用运动 ROI、`--cached-roi-ms > 0` 的缓存复查，以及 `hybrid` 模式下的 `--full-frame-refresh-ms` 周期刷新 ROI。每次检测都会更新 `DetectionCache`，最后绘制画面并发送后端 JSON。当前推荐网络流由本机 `mjpg-streamer` 提供，检测端只读取流并输出 JSON。
 
 ## English Notes
 
@@ -91,12 +92,12 @@
 - Label input: `labels.txt`.
 - Image input: `--image path`.
 - Video input: `--video path`.
-- Network stream input: `--stream-url http://172.20.10.2:8080/?action=stream`.
+- Network stream input: `--stream-url http://127.0.0.1:8080/?action=stream`.
 - Camera input: `--camera-index 0`.
 - Rendered output: `--output path`.
-- Backend JSON output: `--backend-url http://HOST:PORT/api/detections`.
-- Raw MJPEG output for PC backend rendering: `--raw-stream`.
+- Backend JSON output: `--backend-url http://172.20.10.3:5000/api/detections`.
+- Model interface options `--img-size 320`, `--input-name in0`, and `--output-name out0` normally stay unchanged unless the NCNN model is re-exported.
 
 ### Flow
 
-`main()` parses arguments, loads labels, and loads the NCNN network. Image mode runs a single full-frame inference. Video, stream, and camera modes read frames in a loop, optionally update the raw MJPEG fallback with the original frame, prefer MOG2 motion and cached ROIs, then use time-sliced refresh tiles when idle. Each ROI runs through `detect_roi()`, updates `DetectionCache`, renders local debug output when needed, and optionally submits JSON payloads to the backend. TTL is disabled by default with `--detection-ttl-ms 0`; stale boxes are primarily cleared by regional negative evidence. The recommended live-preview path uses Raspberry Pi `mjpg-streamer` as the raw video source and keeps the detector focused on inference plus JSON output.
+`main()` parses arguments, loads labels, and loads the NCNN network. Image mode runs a single full-frame inference. Video, stream, and camera modes read frames in a loop. The default live path uses full-frame NCNN inference with `--roi-mode full` and `--threads 2`, which tested faster and more stable on Raspberry Pi than MOG2 ROI selection. `hybrid` and `roi` modes remain available for experiments: they can use motion ROIs, cached ROI rechecks when `--cached-roi-ms > 0`, and periodic refresh ROIs in `hybrid` mode when `--full-frame-refresh-ms > 0`. Each checked region runs through `detect_roi()`, updates `DetectionCache`, renders local debug output when needed, and submits JSON payloads to the backend. TTL is disabled by default with `--detection-ttl-ms 0`. The recommended live-preview path uses local Raspberry Pi `mjpg-streamer` as the raw video source and keeps the detector focused on inference plus JSON output.

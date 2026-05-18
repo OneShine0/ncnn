@@ -9,7 +9,7 @@
 ### 主要类
 
 - `Roi`：不可变数据类，表示一个矩形区域。
-- `MotionRoiSelector`：根据全帧策略和 OpenCV MOG2 运动检测选择 ROI。
+- `MotionRoiSelector`：根据首帧全图策略和 OpenCV MOG2/帧差运动检测选择 ROI。
 
 ### `Roi` 方法
 
@@ -19,23 +19,23 @@
 
 ### `MotionRoiSelector` 方法
 
-- `__init__(...)`：设置模式、全帧间隔、最小运动面积、padding、MOG2 参数、ROI 保持帧数和平滑系数。
+- `__init__(...)`：设置模式、最小运动面积、padding、MOG2/帧差参数、ROI 保持帧数和平滑系数。
 - `select(frame, frame_id)`：主入口。根据当前帧号和模式返回全帧 ROI、运动 ROI、短暂保持的旧 ROI，或者 `None`。
-- `_motion_roi(frame)`：用 MOG2 背景建模、阈值、形态学开闭运算和轮廓过滤生成运动区域。
+- `_motion_roi(frame)`：根据 `--motion-source` 使用 MOG2、帧差或二者并集生成运动区域。
 - `_stabilize_motion_roi(roi, frame_shape)`：对连续 ROI 做平滑，减少检测区域抖动。
 
 ### ROI 模式
 
 - `full`：每帧全图检测，最稳定但最慢。
-- `roi`：第一帧全图，之后主要依赖运动区域。
-- `hybrid`：默认模式，结合全帧刷新、运动 ROI 和缓存复查。
+- `roi`：第一帧全图，之后主要依赖运动区域；缓存 ROI 由主程序的 `--cached-roi-ms` 控制。
+- `hybrid`：默认模式。当前默认关闭缓存 ROI 和周期刷新，因此首帧全图后主要依赖运动 ROI；设置正数间隔后才启用缓存 ROI 或周期刷新 ROI。
 
 ### 调参建议
 
 - 误触发太多：增大 `--roi-min-area` 或 `--mog2-var-threshold`。
 - 人脸被裁掉：增大 `--roi-padding-pixels`。
-- 静止人脸更新慢：降低 `--face-refresh-ms`。
-- 幽灵框消失慢：降低 `--full-frame-refresh-ms`。
+- 静止缓存框需要复查：设置 `--cached-roi-ms` 为正数。
+- 需要周期兜底刷新：设置 `--full-frame-refresh-ms` 为正数。
 
 ## English Notes
 
@@ -58,4 +58,4 @@
 
 ### Tuning
 
-Increase `--roi-padding-pixels` if targets are clipped, lower `--face-refresh-ms` for steadier still-face updates, and set a positive `--detection-ttl-ms` only when you want time-based expiry diagnostics. Non-full ROI results are regional positive and negative evidence: old boxes centered inside a checked ROI are cleared if the model does not detect them again. The recommended default is `--motion-source mog2`; use `--motion-source frame_diff` for frame-diff-only testing, or `--motion-source both` to merge MOG2 and frame diff. The default `--mog2-history 80` and `--mog2-var-threshold 25.0` are retained. The default `--roi-smooth-alpha 0.6` keeps the older stable ROI feel: higher values are steadier but trail movement more, while lower values react faster but can jitter. For frame diff, lower `--frame-diff-threshold` is more sensitive but noisier, lower `--frame-diff-min-area` catches smaller changes but can false-trigger, and `--frame-diff-alpha` controls how quickly the reference image adapts. Periodic refresh tiles are enabled by default with `--full-frame-refresh-ms 1000` to check the left half, right half, and one centered vertical patch as an idle fallback. Discuss the expected effect before changing MOG2/ROI defaults.
+Increase `--roi-padding-pixels` if targets are clipped, set a positive `--cached-roi-ms` when cached boxes need timed rechecks, and set a positive `--detection-ttl-ms` only when you want time-based expiry diagnostics. Non-full ROI results are regional positive and negative evidence: old boxes centered inside a checked ROI are cleared if the model does not detect them again. The recommended default is `--motion-source mog2`; use `--motion-source frame_diff` for frame-diff-only testing, or `--motion-source both` to merge MOG2 and frame diff. The default `--mog2-history 80` and `--mog2-var-threshold 25.0` are retained. The default `--roi-smooth-alpha 0.6` keeps the older stable ROI feel: higher values are steadier but trail movement more, while lower values react faster but can jitter. For frame diff, lower `--frame-diff-threshold` is more sensitive but noisier, lower `--frame-diff-min-area` catches smaller changes but can false-trigger, and `--frame-diff-alpha` controls how quickly the reference image adapts. Periodic refresh tiles are disabled by default with `--full-frame-refresh-ms 0`; set a positive value to check the left half, right half, and one centered vertical patch as an idle fallback. Discuss the expected effect before changing MOG2/ROI defaults.

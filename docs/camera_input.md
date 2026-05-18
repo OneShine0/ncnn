@@ -12,7 +12,7 @@
 
 ### 主要方法
 
-- `__post_init__()`：创建 OpenCV `VideoCapture`。Windows 使用 `cv2.CAP_DSHOW`，Linux/树莓派使用默认后端；同时设置宽、高、FPS 和缓冲区大小。
+- `__post_init__()`：创建 OpenCV `VideoCapture`。Windows 使用 `cv2.CAP_DSHOW`，Linux/树莓派使用默认后端；同时设置宽、高和缓冲区大小。
 - `is_opened()`：返回摄像头是否成功打开。
 - `read_frame()`：读取一帧图像。返回 `(True, frame)` 或 `(False, None)`；图像会保证是 `uint8`、BGR、三通道。
 - `release()`：释放摄像头资源。
@@ -28,7 +28,7 @@ def read_frame(self) -> tuple[bool, np.ndarray | None]:
 
 ### 输入输出
 
-- 输入：摄像头编号、宽度、高度、FPS。
+- 输入：摄像头编号、宽度、高度。
 - 输出：BGR 格式的 OpenCV 图像帧。
 
 ## English Notes

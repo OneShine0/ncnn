@@ -18,7 +18,6 @@ detect_ncnn_yolov5.py        # Main entry point
 camera_input.py              # Camera source wrapper
 roi_motion.py                # Motion ROI selector
 backend_client.py            # Async backend JSON sender
-raw_stream.py                # Raw MJPEG stream server for backend preview
 requirements.txt             # Python dependency list
 RASPBERRY_PI_DEPLOYMENT.md   # Raspberry Pi beginner tutorial
 docs/                        # Bilingual module notes
@@ -96,10 +95,10 @@ python .\detect_ncnn_yolov5.py
 后台运行并上报后端：
 
 ```powershell
-python .\detect_ncnn_yolov5.py --headless --backend-url http://HOST:PORT/api/detections --device-id win-camera-01
+python .\detect_ncnn_yolov5.py --headless
 ```
 
-Default mode opens camera index `0`. Use `--headless` for no preview window and `--backend-url` to post JSON detections.
+Default mode reads `http://127.0.0.1:8080/?action=stream`, runs full-frame NCNN inference with 2 threads, exposes the latest JSON and WebSocket stream on port `8090`, shows the local preview window, and posts JSON detections to `http://172.20.10.3:5000/api/detections` as `pi-camera-01`. Use `--headless` for no preview window.
 
 ## PC 后端实时预览 / PC Backend Live Preview
 
@@ -107,24 +106,24 @@ Default mode opens camera index `0`. Use `--headless` for no preview window and 
 
 ```powershell
 python .\detect_ncnn_yolov5.py `
-  --stream-url "http://172.20.10.2:8080/?action=stream" `
-  --backend-url http://127.0.0.1:8000/api/detections `
+  --stream-url "http://127.0.0.1:8080/?action=stream" `
+  --backend-url http://172.20.10.3:5000/api/detections `
   --device-id pi-camera-01
 ```
 
 后端设备配置：
 
 ```text
-pi-camera-01 -> http://172.20.10.2:8080/?action=stream
+pi-camera-01 -> http://127.0.0.1:8080/?action=stream
 ```
 
 如果你的 `mjpg-streamer` 首页地址本身就是裸流，也可以把 `--stream-url` 和后端配置写成：
 
 ```text
-http://172.20.10.2:8080/
+http://127.0.0.1:8080/
 ```
 
-视频帧不进入 JSON。后端使用 `mjpg-streamer` 原始 MJPEG + 最新 JSON 近实时叠加，完整需求见 [docs/backend_requirements.md](docs/backend_requirements.md)。项目内的 `--raw-stream` 是备用方案：没有外部推流程序时，检测端才需要自己提供原始 MJPEG。`mjpg-streamer` 通常更流畅，是因为它能直接利用摄像头原生 MJPEG、减少重复 JPEG 编码和图像拷贝，并由专用 C 程序负责推流。
+视频帧不进入 JSON。后端使用 `mjpg-streamer` 原始 MJPEG + 最新 JSON 近实时叠加，完整需求见 [docs/backend_requirements.md](docs/backend_requirements.md)。检测端不再内置 MJPEG 推流服务；`mjpg-streamer` 通常更流畅，是因为它能直接利用摄像头原生 MJPEG、减少重复 JPEG 编码和图像拷贝，并由专用 C 程序负责推流。
 
 ## 常用参数 / Useful Options
 
@@ -134,53 +133,55 @@ http://172.20.10.2:8080/
 --labels labels.txt
 --image path
 --video path
---stream-url http://172.20.10.2:8080/?action=stream
+--stream-url http://127.0.0.1:8080/?action=stream
 --output path
 --camera-index 0
 --camera-width 640
 --camera-height 640
---camera-fps 30
 --headless
 --img-size 320
 --conf-thres 0.25
 --iou-thres 0.45
 --nms-mode class_agnostic
---threads 4
---roi-mode hybrid
+--threads 2
+--roi-mode full
 --full-frame-refresh-mode tiles
---full-frame-refresh-ms 1000
+--full-frame-refresh-ms 0
 --roi-min-area 800
 --roi-min-size-pixels 96
 --roi-padding-pixels 50
 --roi-smooth-alpha 0.6
---face-refresh-ms 500
+--cached-roi-ms 0
 --detection-ttl-ms 0
 --show-expired-ttl
 --expired-ttl-display-frames 8
 --motion-source mog2
 --mog2-history 80
---frame-diff-enabled
 --frame-diff-threshold 12
 --frame-diff-min-area 300
 --frame-diff-alpha 0.08
---raw-stream
---raw-stream-host 0.0.0.0
---raw-stream-port 8090
---raw-stream-fps 10
---raw-stream-width 640
---raw-stream-quality 70
 --status-overlay compact
---backend-url http://HOST:PORT/api/detections
+--latest-json
+--latest-json-host 0.0.0.0
+--latest-json-port 8090
+--backend-url http://172.20.10.3:5000/api/detections
 --device-id pi-camera-01
+```
+
+The latest detection payload is available as both pull and push interfaces:
+
+```text
+GET http://<detector-ip>:8090/latest.json
+WS  ws://<detector-ip>:8090/ws
 ```
 
 ## ROI 策略 / ROI Strategy
 
-- `hybrid`：默认。第一帧和定时刷新做全图检测，其余时间优先使用运动 ROI 和缓存人脸 ROI。
-- `roi`：第一帧全图，之后主要依赖运动 ROI。
+- `hybrid`：默认。首帧全图，之后按优先级使用运动 ROI、缓存 ROI、周期刷新 ROI。
+- `roi`：首帧全图，之后只使用运动 ROI 和缓存 ROI，不使用周期刷新。
 - `full`：每帧全图检测，最稳定但最慢。
 
-The default `hybrid` mode balances stability and speed. It uses MOG2 motion ROIs, cached-face rechecks, regional positive/negative evidence, and 1000 ms time-sliced refresh tiles. In tile mode the refresh ROIs are the left half, right half, and one centered vertical patch; on 640x640 frames the centered patch is `[160,0,480,640]`. Non-full ROIs are regional evidence: old boxes whose centers fall inside the checked ROI are cleared first, then the new ROI detections are added. `--detection-ttl-ms 0` disables time-based stale-box expiry by default, so ghost boxes are cleaned by ROI negative evidence instead; set a positive value such as `500` to test TTL expiry and the red dashed `TTL expired` overlay. `--status-overlay compact` uses a vertical semi-transparent test panel. `--motion-source mog2` is the recommended default; use `--motion-source frame_diff` for frame-diff-only testing or `--motion-source both` to merge MOG2 and frame diff. `--roi-smooth-alpha 0.6` follows the older stable ROI feel; higher values are steadier but trail movement more, while lower values are more responsive but can jitter. For frame diff, lower `--frame-diff-threshold` is more sensitive but noisier, and lower `--frame-diff-min-area` catches smaller changes but can false-trigger more easily.
+The default `full` mode runs full-frame NCNN inference every frame. Raspberry Pi testing showed this is faster and more stable than full-frame MOG2 ROI selection for the current 320x320 model. `--threads 2` is the recommended default because it leaves CPU room for MJPEG capture/decoding and avoids the severe contention seen with 4 NCNN threads. `hybrid` and `roi` remain available for experiments: ROI priority is motion ROI > cached ROI > periodic refresh ROI. `--cached-roi-ms 0` disables cached ROI rechecks by default, and `--full-frame-refresh-ms 0` disables periodic refresh by default. `--detection-ttl-ms 0` disables time-based stale-box expiry by default. `--motion-source mog2` only matters when using `hybrid` or `roi`; use `--motion-source frame_diff` for frame-diff-only testing or `--motion-source both` to merge MOG2 and frame diff. `--img-size 320`, `--input-name in0`, and `--output-name out0` normally stay unchanged unless the NCNN model is re-exported with different settings.
 
 ## 树莓派快速入口 / Raspberry Pi Quick Link
 
@@ -196,7 +197,6 @@ Beginner-friendly Raspberry Pi deployment is documented in the file above.
 - [camera_input.py](docs/camera_input.md)
 - [roi_motion.py](docs/roi_motion.md)
 - [backend_client.py](docs/backend_client.md)
-- [raw_stream.py](docs/raw_stream.md)
 - [backend_requirements.md](docs/backend_requirements.md)
 
 每份文档都包含中文和英文说明，介绍模块职责、主要类/函数、输入输出和移植注意事项。

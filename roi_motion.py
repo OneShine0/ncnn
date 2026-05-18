@@ -41,7 +41,6 @@ class MotionRoiSelector:
     def __init__(
         self,
         mode: str = "roi",
-        full_frame_interval: int = 30,
         min_area: int = 2000,
         padding: float = 0.15,
         padding_pixels: int = 30,
@@ -50,7 +49,6 @@ class MotionRoiSelector:
         hold_frames: int = 0,
         smooth_alpha: float = 0.6,
         motion_source: str = "mog2",
-        frame_diff_enabled: bool = True,
         frame_diff_threshold: int = 12,
         frame_diff_min_area: int = 300,
         frame_diff_alpha: float = 0.08,
@@ -60,14 +58,12 @@ class MotionRoiSelector:
         if motion_source not in {"frame_diff", "mog2", "both"}:
             raise ValueError(f"Unknown motion source: {motion_source}")
         self.mode = mode
-        self.full_frame_interval = max(0, full_frame_interval)
         self.min_area = max(1, min_area)
         self.padding = max(0.0, padding)
         self.padding_pixels = max(0, int(padding_pixels))
         self.hold_frames = max(0, hold_frames)
         self.smooth_alpha = min(max(smooth_alpha, 0.0), 1.0)
         self.motion_source = motion_source
-        self.frame_diff_enabled = bool(frame_diff_enabled)
         self.frame_diff_threshold = max(1, int(frame_diff_threshold))
         self.frame_diff_min_area = max(1, int(frame_diff_min_area))
         self.frame_diff_alpha = min(max(frame_diff_alpha, 0.0), 1.0)
@@ -84,12 +80,6 @@ class MotionRoiSelector:
     def select(self, frame: np.ndarray, frame_id: int) -> Roi | None:
         h, w = frame.shape[:2]
         full_due = self.mode == "full" or frame_id == 1
-        if (
-            self.mode == "hybrid"
-            and self.full_frame_interval > 0
-            and frame_id % self.full_frame_interval == 0
-        ):
-            full_due = True
 
         motion_roi = None
         if self.mode in {"hybrid", "roi"}:
@@ -124,7 +114,7 @@ class MotionRoiSelector:
                 x, y, w, h = cv2.boundingRect(contour)
                 boxes.append((x, y, x + w, y + h))
 
-        if self.frame_diff_enabled and self.motion_source in {"frame_diff", "both"}:
+        if self.motion_source in {"frame_diff", "both"}:
             boxes.extend(self._frame_diff_boxes(frame))
 
         if not boxes:

@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
+import json
 import math
-import platform
+import socket
 import sys
+import threading
 import time
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +26,6 @@ import numpy as np
 
 from backend_client import BackendClient
 from camera_input import CameraInput
-from raw_stream import RawFrameHub, RawMjpegServer
 from roi_motion import MotionRoiSelector, Roi
 
 
@@ -33,6 +37,10 @@ TRAFFIC_LIGHT_COLORS = {
     2: (0, 0, 255),
 }
 ROI_COLOR = (255, 255, 0)
+DEFAULT_STREAM_URL = "http://127.0.0.1:8080/?action=stream"
+DEFAULT_BACKEND_URL = "http://172.20.10.3:5000/api/detections"
+DEFAULT_LATEST_JSON_HOST = "0.0.0.0"
+DEFAULT_LATEST_JSON_PORT = 8090
 
 
 @dataclass
@@ -179,6 +187,273 @@ class ExpiredDetectionOverlay:
         if not self._items:
             return np.empty((0, 6), dtype=np.float32)
         return np.stack([values for values, _expire_at in self._items]).astype(np.float32)
+
+
+class LatestFrameStream:
+    """Read a network stream continuously and expose only the newest frame."""
+
+    def __init__(
+        self,
+        url: str,
+        read_timeout: float = 2.0,
+        capture: Any | None = None,
+    ) -> None:
+        self.url = url
+        self.read_timeout = max(0.1, float(read_timeout))
+        self._cap = capture if capture is not None else cv2.VideoCapture(url)
+        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.fps = self._cap.get(cv2.CAP_PROP_FPS)
+        self._condition = threading.Condition()
+        self._stop = False
+        self._latest_frame: np.ndarray | None = None
+        self._sequence = 0
+        self._last_returned_sequence = 0
+        self._read_failed = False
+        self._thread: threading.Thread | None = None
+
+    def is_opened(self) -> bool:
+        return self._cap.isOpened()
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._reader_loop, name="latest-frame-stream", daemon=True)
+        self._thread.start()
+
+    def read(self) -> tuple[bool, np.ndarray | None]:
+        deadline = time.perf_counter() + self.read_timeout
+        with self._condition:
+            while self._sequence == self._last_returned_sequence and not self._read_failed and not self._stop:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0.0:
+                    return False, None
+                self._condition.wait(timeout=remaining)
+
+            if self._read_failed and self._sequence == self._last_returned_sequence:
+                return False, None
+            if self._latest_frame is None:
+                return False, None
+            self._last_returned_sequence = self._sequence
+            return True, self._latest_frame.copy()
+
+    def release(self) -> None:
+        with self._condition:
+            self._stop = True
+            self._condition.notify_all()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        self._cap.release()
+
+    def _reader_loop(self) -> None:
+        while True:
+            with self._condition:
+                if self._stop:
+                    return
+
+            ok, frame = self._cap.read()
+            with self._condition:
+                if self._stop:
+                    return
+                if not ok or frame is None:
+                    self._read_failed = True
+                    self._condition.notify_all()
+                    return
+                if frame.dtype != np.uint8:
+                    frame = frame.astype(np.uint8, copy=False)
+                if frame.ndim != 3 or frame.shape[2] != 3:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                self._latest_frame = frame
+                self._sequence += 1
+                self._condition.notify_all()
+
+
+class LatestJsonHub:
+    def __init__(self, device_id: str) -> None:
+        self._lock = threading.Lock()
+        self._clients: set[socket.socket] = set()
+        self._payload: dict[str, Any] = {
+            "device_id": device_id,
+            "status": "warming_up",
+            "timestamp_ms": int(time.time() * 1000),
+            "frame_id": 0,
+            "image_size": None,
+            "roi": None,
+            "fps": 0.0,
+            "inference_ms": 0.0,
+            "detections": [],
+        }
+
+    def update(self, payload: dict[str, Any]) -> None:
+        body: bytes
+        with self._lock:
+            self._payload = dict(payload)
+            body = self._snapshot_bytes_locked()
+        self.broadcast(body)
+
+    def snapshot_bytes(self) -> bytes:
+        with self._lock:
+            return self._snapshot_bytes_locked()
+
+    def add_ws_client(self, client: socket.socket) -> None:
+        with self._lock:
+            self._clients.add(client)
+
+    def remove_ws_client(self, client: socket.socket) -> None:
+        with self._lock:
+            self._clients.discard(client)
+
+    def broadcast(self, body: bytes | None = None) -> None:
+        if body is None:
+            body = self.snapshot_bytes()
+        frame = websocket_text_frame(body)
+        with self._lock:
+            clients = list(self._clients)
+        stale: list[socket.socket] = []
+        for client in clients:
+            try:
+                client.sendall(frame)
+            except OSError:
+                stale.append(client)
+        if stale:
+            with self._lock:
+                for client in stale:
+                    self._clients.discard(client)
+                    try:
+                        client.close()
+                    except OSError:
+                        pass
+
+    def _snapshot_bytes_locked(self) -> bytes:
+        payload = dict(self._payload)
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def websocket_text_frame(payload: bytes) -> bytes:
+    length = len(payload)
+    if length < 126:
+        header = bytes((0x81, length))
+    elif length <= 0xFFFF:
+        header = bytes((0x81, 126)) + length.to_bytes(2, "big")
+    else:
+        header = bytes((0x81, 127)) + length.to_bytes(8, "big")
+    return header + payload
+
+
+class LatestJsonServer:
+    def __init__(self, host: str, port: int, hub: LatestJsonHub) -> None:
+        self.host = host
+        self.port = int(port)
+        self.hub = hub
+        self._httpd: ThreadingHTTPServer | None = None
+        self._thread: threading.Thread | None = None
+
+    @property
+    def url(self) -> str:
+        return f"http://{self.host}:{self.port}/latest.json"
+
+    def start(self) -> None:
+        if self._httpd is not None:
+            return
+
+        hub = self.hub
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                path = self.path.split("?", 1)[0]
+                if path == "/ws":
+                    self._handle_websocket()
+                    return
+                if path == "/health":
+                    self._send_bytes(b'{"status":"ok"}', "application/json; charset=utf-8")
+                    return
+                if path != "/latest.json":
+                    self.send_error(404)
+                    return
+                self._send_bytes(hub.snapshot_bytes(), "application/json; charset=utf-8")
+
+            def log_message(self, _format: str, *_args: Any) -> None:
+                return
+
+            def _handle_websocket(self) -> None:
+                key = self.headers.get("Sec-WebSocket-Key")
+                upgrade = self.headers.get("Upgrade", "")
+                if not key or upgrade.lower() != "websocket":
+                    self.send_error(400)
+                    return
+
+                accept_source = (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
+                accept = base64.b64encode(hashlib.sha1(accept_source).digest()).decode("ascii")
+                self.send_response(101, "Switching Protocols")
+                self.send_header("Upgrade", "websocket")
+                self.send_header("Connection", "Upgrade")
+                self.send_header("Sec-WebSocket-Accept", accept)
+                self.end_headers()
+
+                client = self.connection
+                hub.add_ws_client(client)
+                try:
+                    client.sendall(websocket_text_frame(hub.snapshot_bytes()))
+                    while True:
+                        data = client.recv(2)
+                        if not data:
+                            break
+                        opcode = data[0] & 0x0F
+                        masked = bool(data[1] & 0x80)
+                        length = data[1] & 0x7F
+                        if length == 126:
+                            ext = client.recv(2)
+                            if len(ext) < 2:
+                                break
+                            length = int.from_bytes(ext, "big")
+                        elif length == 127:
+                            ext = client.recv(8)
+                            if len(ext) < 8:
+                                break
+                            length = int.from_bytes(ext, "big")
+                        mask = client.recv(4) if masked else b""
+                        remaining = length
+                        while remaining > 0:
+                            chunk = client.recv(min(remaining, 4096))
+                            if not chunk:
+                                remaining = 0
+                                break
+                            remaining -= len(chunk)
+                        if opcode == 0x8:
+                            break
+                        if not mask and length > 0:
+                            continue
+                except OSError:
+                    pass
+                finally:
+                    hub.remove_ws_client(client)
+
+            def _send_bytes(self, body: bytes, content_type: str) -> None:
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(body)
+
+        self._httpd = ThreadingHTTPServer((self.host, self.port), Handler)
+        self.port = int(self._httpd.server_address[1])
+        self._thread = threading.Thread(
+            target=self._httpd.serve_forever,
+            name="latest-json-server",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def close(self) -> None:
+        if self._httpd is None:
+            return
+        self._httpd.shutdown()
+        self._httpd.server_close()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        self._httpd = None
+        self._thread = None
 
 
 class TextRenderer:
@@ -360,14 +635,23 @@ def box_center_in_roi(box: np.ndarray, roi: Roi, margin_pixels: int = 0) -> bool
 
 
 def ttl_frames_from_args(args: argparse.Namespace, fps: float) -> int:
-    explicit_frames = getattr(args, "detection_ttl_frames", None)
-    if explicit_frames is not None:
-        return max(0, int(explicit_frames))
     ttl_ms = max(0.0, float(getattr(args, "detection_ttl_ms", 0.0)))
     if ttl_ms <= 0.0:
         return 0
-    effective_fps = fps if fps and fps > 1.0 else float(getattr(args, "camera_fps", 0) or 25.0)
+    effective_fps = fps if fps and fps > 1.0 else 25.0
     return max(1, int(math.ceil(effective_fps * ttl_ms / 1000.0)))
+
+
+def cached_roi_due(
+    detections: np.ndarray,
+    now: float,
+    last_refresh_time: float,
+    interval_ms: float,
+) -> bool:
+    if detections.size == 0:
+        return False
+    interval = max(0.0, float(interval_ms))
+    return interval > 0.0 and (now - last_refresh_time) * 1000.0 >= interval
 
 
 class RefreshTileScheduler:
@@ -596,8 +880,13 @@ def load_net(args: argparse.Namespace) -> ncnn.Net:
     return net
 
 
-def detect(net: ncnn.Net, image: np.ndarray, args: argparse.Namespace) -> tuple[np.ndarray, float]:
+def detect(
+    net: ncnn.Net,
+    image: np.ndarray,
+    args: argparse.Namespace,
+) -> tuple[np.ndarray, float]:
     mat, scale, pad = make_input(image, args.img_size)
+
     extractor = net.create_extractor()
     ret = extractor.input(args.input_name, mat)
     if ret != 0:
@@ -689,6 +978,16 @@ def build_backend_payload(
         "inference_ms": round(float(inference_ms), 2),
         "detections": detection_dicts(detections, labels, cached_flags),
     }
+
+
+def start_latest_json_server(args: argparse.Namespace) -> tuple[LatestJsonHub | None, LatestJsonServer | None]:
+    if not args.latest_json:
+        return None, None
+    hub = LatestJsonHub(args.device_id)
+    server = LatestJsonServer(args.latest_json_host, args.latest_json_port, hub)
+    server.start()
+    print(f"latest json: {server.url}")
+    return hub, server
 
 
 def draw_label(
@@ -853,6 +1152,36 @@ def draw_status(
     return image
 
 
+def render_diagnostic_frame(
+    frame: np.ndarray,
+    detections: np.ndarray,
+    labels: list[str],
+    text_renderer: TextRenderer,
+    expired_detections: np.ndarray,
+    fps: float,
+    inference_ms: float,
+    roi: Roi | None,
+    skipped: bool,
+    args: argparse.Namespace,
+    current_ttl_frames: int,
+) -> np.ndarray:
+    rendered = draw_detections(frame, detections, labels, text_renderer)
+    rendered = draw_expired_detections(rendered, expired_detections, text_renderer)
+    return draw_status(
+        rendered,
+        text_renderer,
+        fps,
+        inference_ms,
+        roi,
+        detections,
+        skipped=skipped,
+        mode=args.status_overlay,
+        ttl_frames=current_ttl_frames,
+        ttl_ms=args.detection_ttl_ms,
+        refresh_mode=args.full_frame_refresh_mode,
+    )
+
+
 def run_image(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> None:
     image = cv2.imread(str(args.image))
     if image is None:
@@ -899,7 +1228,6 @@ def run_video(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> Non
 
     roi_selector = MotionRoiSelector(
         mode=args.roi_mode,
-        full_frame_interval=args.full_frame_interval,
         min_area=args.roi_min_area,
         padding=args.roi_padding,
         padding_pixels=args.roi_padding_pixels,
@@ -908,12 +1236,12 @@ def run_video(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> Non
         hold_frames=args.roi_hold_frames,
         smooth_alpha=args.roi_smooth_alpha,
         motion_source=args.motion_source,
-        frame_diff_enabled=args.frame_diff_enabled,
         frame_diff_threshold=args.frame_diff_threshold,
         frame_diff_min_area=args.frame_diff_min_area,
         frame_diff_alpha=args.frame_diff_alpha,
     )
     backend = BackendClient(args.backend_url, timeout=args.backend_timeout, max_queue=args.backend_queue)
+    latest_json_hub, latest_json_server = start_latest_json_server(args)
     text_renderer = TextRenderer()
     fps_meter = FpsMeter()
     detection_cache = DetectionCache(
@@ -926,21 +1254,10 @@ def run_video(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> Non
         args.full_frame_refresh_ms,
         args.img_size,
     )
-    raw_hub: RawFrameHub | None = None
-    raw_server: RawMjpegServer | None = None
-    if args.raw_stream:
-        raw_hub = RawFrameHub(
-            fps=args.raw_stream_fps,
-            width=args.raw_stream_width,
-            quality=args.raw_stream_quality,
-        )
-        raw_server = RawMjpegServer(args.raw_stream_host, args.raw_stream_port, raw_hub)
-        raw_server.start()
-        print(f"raw stream: {raw_server.url}")
-
     frame_id = 0
     last_inference_ms = 0.0
-    last_face_refresh_time = 0.0
+    last_cached_roi_time = 0.0
+    render_output = output_path is not None or not args.headless
 
     if not args.headless:
         print("Press q or Esc to quit.")
@@ -950,8 +1267,6 @@ def run_video(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> Non
             ok, frame = video.read()
             if not ok or frame is None:
                 break
-            if raw_hub is not None:
-                raw_hub.update(frame)
 
             frame_id += 1
             now = time.perf_counter()
@@ -968,18 +1283,11 @@ def run_video(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> Non
                     frame.shape[:2],
                     proximity_pixels=args.roi_padding_pixels,
                 )
-            elif (
-                active_detections.size > 0
-                and (
-                    (
-                        args.face_refresh_ms > 0
-                        and (now - last_face_refresh_time) * 1000.0 >= args.face_refresh_ms
-                    )
-                    or (
-                        args.cached_roi_interval > 0
-                        and frame_id % args.cached_roi_interval == 0
-                    )
-                )
+            elif cached_roi_due(
+                active_detections,
+                now,
+                last_cached_roi_time,
+                args.cached_roi_ms,
             ):
                 roi = cached_roi_from_detections(
                     active_detections,
@@ -999,7 +1307,8 @@ def run_video(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> Non
                     detection_cache.update_full(raw_detections, frame_id)
                 else:
                     detection_cache.update_region(raw_detections, frame_id, roi)
-                last_face_refresh_time = now
+                if roi.reason == "cached":
+                    last_cached_roi_time = now
                 detections, cached_flags = detection_cache.snapshot(frame_id)
                 last_inference_ms = inference_ms
                 payload = build_backend_payload(
@@ -1013,6 +1322,8 @@ def run_video(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> Non
                     inference_ms,
                     cached_flags,
                 )
+                if latest_json_hub is not None:
+                    latest_json_hub.update(payload)
                 backend.submit(payload)
             else:
                 detections, _cached_flags = detection_cache.snapshot(frame_id)
@@ -1025,41 +1336,41 @@ def run_video(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> Non
                 detection_cache.pop_expired_tracks()
                 expired_detections = np.empty((0, 6), dtype=np.float32)
 
-            rendered = draw_detections(frame, detections, labels, text_renderer)
-            rendered = draw_expired_detections(rendered, expired_detections, text_renderer)
-            rendered = draw_status(
-                rendered,
-                text_renderer,
-                fps,
-                inference_ms,
-                roi,
-                detections,
-                skipped=skipped,
-                mode=args.status_overlay,
-                ttl_frames=current_ttl_frames,
-                ttl_ms=args.detection_ttl_ms,
-                refresh_mode=args.full_frame_refresh_mode,
-            )
+            should_quit = False
+            if render_output:
+                rendered = render_diagnostic_frame(
+                    frame,
+                    detections,
+                    labels,
+                    text_renderer,
+                    expired_detections,
+                    fps,
+                    inference_ms,
+                    roi,
+                    skipped,
+                    args,
+                    current_ttl_frames,
+                )
 
-            if output_path is not None:
-                if writer is None:
-                    h, w = rendered.shape[:2]
-                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                    writer = cv2.VideoWriter(str(output_path), fourcc, output_fps, (w, h))
-                    if not writer.isOpened():
-                        raise RuntimeError(f"Could not write output video: {output_path}")
-                writer.write(rendered)
+                if output_path is not None:
+                    if writer is None:
+                        h, w = rendered.shape[:2]
+                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                        writer = cv2.VideoWriter(str(output_path), fourcc, output_fps, (w, h))
+                        if not writer.isOpened():
+                            raise RuntimeError(f"Could not write output video: {output_path}")
+                    writer.write(rendered)
 
-            if args.headless:
-                continue
+                if not args.headless:
+                    cv2.imshow("ncnn yolov5 video", rendered)
+                    key = cv2.waitKey(1) & 0xFF
+                    should_quit = key in (27, ord("q"))
 
-            cv2.imshow("ncnn yolov5 video", rendered)
-            key = cv2.waitKey(1) & 0xFF
-            if key in (27, ord("q")):
+            if should_quit:
                 break
     finally:
-        if raw_server is not None:
-            raw_server.close()
+        if latest_json_server is not None:
+            latest_json_server.close()
         backend.close()
         video.release()
         if writer is not None:
@@ -1074,19 +1385,18 @@ def run_video(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> Non
 
 
 def run_stream(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> None:
-    stream = cv2.VideoCapture(args.stream_url)
-    if not stream.isOpened():
+    stream = LatestFrameStream(args.stream_url)
+    if not stream.is_opened():
         raise RuntimeError(f"Could not open stream URL: {args.stream_url}")
-    stream.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    stream.start()
 
-    source_fps = stream.get(cv2.CAP_PROP_FPS)
+    source_fps = stream.fps
     output_fps = source_fps if source_fps and source_fps > 0 else 25.0
     writer: cv2.VideoWriter | None = None
     output_path = args.output
 
     roi_selector = MotionRoiSelector(
         mode=args.roi_mode,
-        full_frame_interval=args.full_frame_interval,
         min_area=args.roi_min_area,
         padding=args.roi_padding,
         padding_pixels=args.roi_padding_pixels,
@@ -1095,12 +1405,12 @@ def run_stream(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> No
         hold_frames=args.roi_hold_frames,
         smooth_alpha=args.roi_smooth_alpha,
         motion_source=args.motion_source,
-        frame_diff_enabled=args.frame_diff_enabled,
         frame_diff_threshold=args.frame_diff_threshold,
         frame_diff_min_area=args.frame_diff_min_area,
         frame_diff_alpha=args.frame_diff_alpha,
     )
     backend = BackendClient(args.backend_url, timeout=args.backend_timeout, max_queue=args.backend_queue)
+    latest_json_hub, latest_json_server = start_latest_json_server(args)
     text_renderer = TextRenderer()
     fps_meter = FpsMeter()
     detection_cache = DetectionCache(
@@ -1113,21 +1423,10 @@ def run_stream(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> No
         args.full_frame_refresh_ms,
         args.img_size,
     )
-    raw_hub: RawFrameHub | None = None
-    raw_server: RawMjpegServer | None = None
-    if args.raw_stream:
-        raw_hub = RawFrameHub(
-            fps=args.raw_stream_fps,
-            width=args.raw_stream_width,
-            quality=args.raw_stream_quality,
-        )
-        raw_server = RawMjpegServer(args.raw_stream_host, args.raw_stream_port, raw_hub)
-        raw_server.start()
-        print(f"raw stream: {raw_server.url}")
-
     frame_id = 0
     last_inference_ms = 0.0
-    last_face_refresh_time = 0.0
+    last_cached_roi_time = 0.0
+    render_output = output_path is not None or not args.headless
 
     if not args.headless:
         print("Press q or Esc to quit.")
@@ -1137,8 +1436,6 @@ def run_stream(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> No
             ok, frame = stream.read()
             if not ok or frame is None:
                 break
-            if raw_hub is not None:
-                raw_hub.update(frame)
 
             frame_id += 1
             now = time.perf_counter()
@@ -1155,18 +1452,11 @@ def run_stream(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> No
                     frame.shape[:2],
                     proximity_pixels=args.roi_padding_pixels,
                 )
-            elif (
-                active_detections.size > 0
-                and (
-                    (
-                        args.face_refresh_ms > 0
-                        and (now - last_face_refresh_time) * 1000.0 >= args.face_refresh_ms
-                    )
-                    or (
-                        args.cached_roi_interval > 0
-                        and frame_id % args.cached_roi_interval == 0
-                    )
-                )
+            elif cached_roi_due(
+                active_detections,
+                now,
+                last_cached_roi_time,
+                args.cached_roi_ms,
             ):
                 roi = cached_roi_from_detections(
                     active_detections,
@@ -1186,7 +1476,8 @@ def run_stream(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> No
                     detection_cache.update_full(raw_detections, frame_id)
                 else:
                     detection_cache.update_region(raw_detections, frame_id, roi)
-                last_face_refresh_time = now
+                if roi.reason == "cached":
+                    last_cached_roi_time = now
                 detections, cached_flags = detection_cache.snapshot(frame_id)
                 last_inference_ms = inference_ms
                 payload = build_backend_payload(
@@ -1200,6 +1491,8 @@ def run_stream(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> No
                     inference_ms,
                     cached_flags,
                 )
+                if latest_json_hub is not None:
+                    latest_json_hub.update(payload)
                 backend.submit(payload)
             else:
                 detections, _cached_flags = detection_cache.snapshot(frame_id)
@@ -1212,41 +1505,41 @@ def run_stream(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> No
                 detection_cache.pop_expired_tracks()
                 expired_detections = np.empty((0, 6), dtype=np.float32)
 
-            rendered = draw_detections(frame, detections, labels, text_renderer)
-            rendered = draw_expired_detections(rendered, expired_detections, text_renderer)
-            rendered = draw_status(
-                rendered,
-                text_renderer,
-                fps,
-                inference_ms,
-                roi,
-                detections,
-                skipped=skipped,
-                mode=args.status_overlay,
-                ttl_frames=current_ttl_frames,
-                ttl_ms=args.detection_ttl_ms,
-                refresh_mode=args.full_frame_refresh_mode,
-            )
+            should_quit = False
+            if render_output:
+                rendered = render_diagnostic_frame(
+                    frame,
+                    detections,
+                    labels,
+                    text_renderer,
+                    expired_detections,
+                    fps,
+                    inference_ms,
+                    roi,
+                    skipped,
+                    args,
+                    current_ttl_frames,
+                )
 
-            if output_path is not None:
-                if writer is None:
-                    h, w = rendered.shape[:2]
-                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                    writer = cv2.VideoWriter(str(output_path), fourcc, output_fps, (w, h))
-                    if not writer.isOpened():
-                        raise RuntimeError(f"Could not write output video: {output_path}")
-                writer.write(rendered)
+                if output_path is not None:
+                    if writer is None:
+                        h, w = rendered.shape[:2]
+                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                        writer = cv2.VideoWriter(str(output_path), fourcc, output_fps, (w, h))
+                        if not writer.isOpened():
+                            raise RuntimeError(f"Could not write output video: {output_path}")
+                    writer.write(rendered)
 
-            if args.headless:
-                continue
+                if not args.headless:
+                    cv2.imshow("ncnn yolov5 stream", rendered)
+                    key = cv2.waitKey(1) & 0xFF
+                    should_quit = key in (27, ord("q"))
 
-            cv2.imshow("ncnn yolov5 stream", rendered)
-            key = cv2.waitKey(1) & 0xFF
-            if key in (27, ord("q")):
+            if should_quit:
                 break
     finally:
-        if raw_server is not None:
-            raw_server.close()
+        if latest_json_server is not None:
+            latest_json_server.close()
         backend.close()
         stream.release()
         if writer is not None:
@@ -1265,14 +1558,12 @@ def run_camera(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> No
         camera_index=args.camera_index,
         width=args.camera_width,
         height=args.camera_height,
-        fps=args.camera_fps,
     )
     if not camera.is_opened():
         raise RuntimeError(f"Could not open camera index {args.camera_index}")
 
     roi_selector = MotionRoiSelector(
         mode=args.roi_mode,
-        full_frame_interval=args.full_frame_interval,
         min_area=args.roi_min_area,
         padding=args.roi_padding,
         padding_pixels=args.roi_padding_pixels,
@@ -1281,12 +1572,12 @@ def run_camera(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> No
         hold_frames=args.roi_hold_frames,
         smooth_alpha=args.roi_smooth_alpha,
         motion_source=args.motion_source,
-        frame_diff_enabled=args.frame_diff_enabled,
         frame_diff_threshold=args.frame_diff_threshold,
         frame_diff_min_area=args.frame_diff_min_area,
         frame_diff_alpha=args.frame_diff_alpha,
     )
     backend = BackendClient(args.backend_url, timeout=args.backend_timeout, max_queue=args.backend_queue)
+    latest_json_hub, latest_json_server = start_latest_json_server(args)
     text_renderer = TextRenderer()
     fps_meter = FpsMeter()
     detection_cache = DetectionCache(ttl_frames=ttl_frames_from_args(args, 0.0), dedupe_iou=args.iou_thres)
@@ -1296,21 +1587,9 @@ def run_camera(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> No
         args.full_frame_refresh_ms,
         args.img_size,
     )
-    raw_hub: RawFrameHub | None = None
-    raw_server: RawMjpegServer | None = None
-    if args.raw_stream:
-        raw_hub = RawFrameHub(
-            fps=args.raw_stream_fps,
-            width=args.raw_stream_width,
-            quality=args.raw_stream_quality,
-        )
-        raw_server = RawMjpegServer(args.raw_stream_host, args.raw_stream_port, raw_hub)
-        raw_server.start()
-        print(f"raw stream: {raw_server.url}")
-
     frame_id = 0
     last_inference_ms = 0.0
-    last_face_refresh_time = 0.0
+    last_cached_roi_time = 0.0
 
     if not args.headless:
         print("Press q or Esc to quit.")
@@ -1320,8 +1599,6 @@ def run_camera(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> No
             ok, frame = camera.read_frame()
             if not ok or frame is None:
                 break
-            if raw_hub is not None:
-                raw_hub.update(frame)
 
             frame_id += 1
             now = time.perf_counter()
@@ -1338,18 +1615,11 @@ def run_camera(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> No
                     frame.shape[:2],
                     proximity_pixels=args.roi_padding_pixels,
                 )
-            elif (
-                active_detections.size > 0
-                and (
-                    (
-                        args.face_refresh_ms > 0
-                        and (now - last_face_refresh_time) * 1000.0 >= args.face_refresh_ms
-                    )
-                    or (
-                        args.cached_roi_interval > 0
-                        and frame_id % args.cached_roi_interval == 0
-                    )
-                )
+            elif cached_roi_due(
+                active_detections,
+                now,
+                last_cached_roi_time,
+                args.cached_roi_ms,
             ):
                 roi = cached_roi_from_detections(
                     active_detections,
@@ -1369,7 +1639,8 @@ def run_camera(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> No
                     detection_cache.update_full(raw_detections, frame_id)
                 else:
                     detection_cache.update_region(raw_detections, frame_id, roi)
-                last_face_refresh_time = now
+                if roi.reason == "cached":
+                    last_cached_roi_time = now
                 detections, cached_flags = detection_cache.snapshot(frame_id)
                 last_inference_ms = inference_ms
                 payload = build_backend_payload(
@@ -1383,6 +1654,8 @@ def run_camera(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> No
                     inference_ms,
                     cached_flags,
                 )
+                if latest_json_hub is not None:
+                    latest_json_hub.update(payload)
                 backend.submit(payload)
             else:
                 detections, cached_flags = detection_cache.snapshot(frame_id)
@@ -1398,28 +1671,26 @@ def run_camera(args: argparse.Namespace, net: ncnn.Net, labels: list[str]) -> No
             if args.headless:
                 continue
 
-            rendered = draw_detections(frame, detections, labels, text_renderer)
-            rendered = draw_expired_detections(rendered, expired_detections, text_renderer)
-            rendered = draw_status(
-                rendered,
+            rendered = render_diagnostic_frame(
+                frame,
+                detections,
+                labels,
                 text_renderer,
+                expired_detections,
                 fps,
                 inference_ms,
                 roi,
-                detections,
-                skipped=skipped,
-                mode=args.status_overlay,
-                ttl_frames=current_ttl_frames,
-                ttl_ms=args.detection_ttl_ms,
-                refresh_mode=args.full_frame_refresh_mode,
+                skipped,
+                args,
+                current_ttl_frames,
             )
             cv2.imshow("ncnn yolov5 camera", rendered)
             key = cv2.waitKey(1) & 0xFF
             if key in (27, ord("q")):
                 break
     finally:
-        if raw_server is not None:
-            raw_server.close()
+        if latest_json_server is not None:
+            latest_json_server.close()
         backend.close()
         camera.release()
         if not args.headless:
@@ -1445,13 +1716,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--labels", type=Path, default=ROOT / "labels.txt")
     parser.add_argument("--image", type=Path, help="Image path for single-image inference.")
     parser.add_argument("--video", type=Path, help="Video path for file-based inference.")
-    parser.add_argument("--stream-url", help="Network video stream URL, for example an mjpg-streamer URL.")
+    parser.add_argument(
+        "--stream-url",
+        default=DEFAULT_STREAM_URL,
+        help="Network video stream URL, for example an mjpg-streamer URL.",
+    )
     parser.add_argument("--output", type=Path, help="Output image or video path.")
     parser.add_argument("--camera-index", type=int, default=0)
-    parser.add_argument("--camera", type=int, dest="camera_index", help=argparse.SUPPRESS)
     parser.add_argument("--camera-width", type=int, default=640)
     parser.add_argument("--camera-height", type=int, default=640)
-    parser.add_argument("--camera-fps", type=int)
     parser.add_argument("--headless", action="store_true", help="Do not open an OpenCV preview window.")
     parser.add_argument("--self-test", action="store_true", help="Run one inference on a blank image.")
     parser.add_argument("--img-size", type=int, default=320)
@@ -1460,54 +1733,57 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--conf-thres", type=float, default=0.25)
     parser.add_argument("--iou-thres", type=float, default=0.45)
     parser.add_argument("--nms-mode", choices=("class_aware", "class_agnostic"), default="class_agnostic")
-    parser.add_argument("--threads", type=int, default=4)
-    parser.add_argument("--roi-mode", choices=("hybrid", "roi", "full"), default="hybrid")
-    parser.add_argument("--full-frame-interval", type=int, default=0)
+    parser.add_argument("--threads", type=int, default=2)
+    parser.add_argument("--roi-mode", choices=("hybrid", "roi", "full"), default="full")
     parser.add_argument("--full-frame-refresh-mode", choices=("full", "tiles"), default="tiles")
-    parser.add_argument("--full-frame-refresh-ms", type=float, default=1000.0)
+    parser.add_argument("--full-frame-refresh-ms", type=float, default=0.0)
     parser.add_argument("--roi-min-area", type=int, default=800)
     parser.add_argument("--roi-min-size-pixels", type=int, default=96)
     parser.add_argument("--roi-padding", type=float, default=0.15)
     parser.add_argument("--roi-padding-pixels", type=int, default=50)
     parser.add_argument("--roi-hold-frames", type=int, default=0)
     parser.add_argument("--roi-smooth-alpha", type=float, default=0.6)
-    parser.add_argument("--face-refresh-ms", type=float, default=500.0)
-    parser.add_argument("--cached-roi-interval", type=int, default=0)
+    parser.add_argument("--cached-roi-ms", type=float, default=0.0)
     parser.add_argument("--cached-roi-padding-pixels", type=int, default=60)
     parser.add_argument("--detection-ttl-ms", type=float, default=0.0)
-    parser.add_argument("--detection-ttl-frames", type=int)
     parser.add_argument("--show-expired-ttl", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--expired-ttl-display-frames", type=int, default=8)
     parser.add_argument("--status-overlay", choices=("compact", "full", "off"), default="compact")
     parser.add_argument("--motion-source", choices=("frame_diff", "mog2", "both"), default="mog2")
     parser.add_argument("--mog2-history", type=int, default=80)
     parser.add_argument("--mog2-var-threshold", type=float, default=25.0)
-    parser.add_argument("--frame-diff-enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--frame-diff-threshold", type=int, default=12)
     parser.add_argument("--frame-diff-min-area", type=int, default=300)
     parser.add_argument("--frame-diff-alpha", type=float, default=0.08)
-    parser.add_argument("--raw-stream", action="store_true", help="Serve raw MJPEG frames for backend preview.")
-    parser.add_argument("--raw-stream-host", default="0.0.0.0")
-    parser.add_argument("--raw-stream-port", type=int, default=8090)
-    parser.add_argument("--raw-stream-fps", type=float, default=10.0)
-    parser.add_argument("--raw-stream-width", type=int, default=640)
-    parser.add_argument("--raw-stream-quality", type=int, default=70)
-    parser.add_argument("--backend-url")
+    parser.add_argument("--backend-url", default=DEFAULT_BACKEND_URL)
     parser.add_argument("--backend-timeout", type=float, default=1.0)
     parser.add_argument("--backend-queue", type=int, default=8)
-    parser.add_argument("--device-id", default=platform.node() or "camera-01")
+    parser.add_argument(
+        "--latest-json",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Expose the latest detection payload at /latest.json.",
+    )
+    parser.add_argument("--latest-json-host", default=DEFAULT_LATEST_JSON_HOST)
+    parser.add_argument("--latest-json-port", type=int, default=DEFAULT_LATEST_JSON_PORT)
+    parser.add_argument("--device-id", default="pi-camera-01")
     return parser.parse_args()
+
+
+def cli_option_provided(argv: list[str], option: str) -> bool:
+    return any(arg == option or arg.startswith(f"{option}=") for arg in argv)
 
 
 def main() -> None:
     args = parse_args()
+    explicit_stream_url = cli_option_provided(sys.argv[1:], "--stream-url")
     input_modes = sum(
         bool(value)
         for value in (
             args.self_test,
             args.image is not None,
             args.video is not None,
-            args.stream_url is not None,
+            explicit_stream_url,
         )
     )
     if input_modes > 1:

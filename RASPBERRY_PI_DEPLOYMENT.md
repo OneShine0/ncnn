@@ -48,7 +48,6 @@ detect_ncnn_yolov5.py
 camera_input.py
 roi_motion.py
 backend_client.py
-raw_stream.py
 requirements.txt
 README.md
 RASPBERRY_PI_DEPLOYMENT.md
@@ -128,7 +127,7 @@ v4l2-ctl --list-devices
 有桌面环境时可以打开预览窗口：
 
 ```bash
-python3 detect_ncnn_yolov5.py --camera-index 0 --camera-width 640 --camera-height 640 --threads 4
+python3 detect_ncnn_yolov5.py --camera-index 0 --camera-width 640 --camera-height 640 --threads 2 --roi-mode full
 ```
 
 无桌面或 SSH 环境请使用 headless：
@@ -139,7 +138,8 @@ python3 detect_ncnn_yolov5.py \
   --camera-index 0 \
   --camera-width 640 \
   --camera-height 640 \
-  --threads 4
+  --threads 2 \
+  --roi-mode full
 ```
 
 Headless mode is recommended on Raspberry Pi because GUI preview costs CPU and may fail over SSH.
@@ -170,12 +170,13 @@ For Picamera2, return BGR `uint8` frames and keep the same public methods.
 ```bash
 python3 detect_ncnn_yolov5.py \
   --headless \
-  --backend-url http://HOST:PORT/api/detections \
+  --backend-url http://172.20.10.3:5000/api/detections \
   --device-id pi-camera-01 \
   --camera-index 0 \
   --camera-width 640 \
   --camera-height 640 \
-  --threads 4
+  --threads 2 \
+  --roi-mode full
 ```
 
 后端会收到 HTTP `POST` JSON：
@@ -209,18 +210,18 @@ Any `2xx` backend response is accepted.
 
 ```powershell
 python .\detect_ncnn_yolov5.py `
-  --stream-url "http://172.20.10.2:8080/?action=stream" `
-  --backend-url http://127.0.0.1:8000/api/detections `
+  --stream-url "http://127.0.0.1:8080/?action=stream" `
+  --backend-url http://172.20.10.3:5000/api/detections `
   --device-id pi-camera-01
 ```
 
 PC 后端设备配置表中写入：
 
 ```text
-pi-camera-01 -> http://172.20.10.2:8080/?action=stream
+pi-camera-01 -> http://127.0.0.1:8080/?action=stream
 ```
 
-视频帧不进入 JSON。PC 后端拉取 `mjpg-streamer` 原始 MJPEG，并用最新 JSON 检测框在网页端叠加渲染。完整后端需求见 `docs/backend_requirements.md`。项目内 `--raw-stream` 仅作为备用方案：没有外部推流程序时才由检测端自己提供原始 MJPEG。
+视频帧不进入 JSON。PC 后端拉取 `mjpg-streamer` 原始 MJPEG，并用最新 JSON 检测框在网页端叠加渲染。完整后端需求见 `docs/backend_requirements.md`。检测端不再内置 MJPEG 推流服务。
 
 ## 8. 推荐参数 / Recommended Pi Parameters
 
@@ -228,24 +229,24 @@ PC 检测端读取树莓派 `mjpg-streamer` 时，先使用默认参数，只明
 
 ```powershell
 python .\detect_ncnn_yolov5.py `
-  --stream-url "http://172.20.10.2:8080/?action=stream" `
-  --backend-url http://127.0.0.1:8000/api/detections `
+  --stream-url "http://127.0.0.1:8080/?action=stream" `
+  --backend-url http://172.20.10.3:5000/api/detections `
   --device-id pi-camera-01 `
-  --threads 4 `
-  --roi-mode hybrid `
+  --threads 2 `
+  --roi-mode full `
   --full-frame-refresh-mode tiles `
-  --full-frame-refresh-ms 1000 `
-  --motion-source mog2 `
+  --full-frame-refresh-ms 0 `
+  --cached-roi-ms 0 `
   --status-overlay compact
 ```
 
-The recommended default path is Raspberry Pi `mjpg-streamer` + PC NCNN detection + MOG2 + cached ROI + ROI negative evidence + 1000 ms time-sliced refresh tiles. `mjpg-streamer` usually looks smoother than the Python fallback because it can forward camera-native MJPEG with less JPEG re-encoding and copying. In tile mode one cycle checks the left half, the right half, and one centered vertical patch; on 640x640 frames the centered patch is `[160,0,480,640]`. Non-full ROI detections are regional evidence: stale boxes inside the checked ROI are removed if they are not detected again. `--detection-ttl-ms 0` disables time-based stale-box expiry by default, so TTL-expired red dashed ghosts only appear when you manually set a positive TTL such as `--detection-ttl-ms 500`. `--motion-source mog2` is the recommended default; use `--motion-source frame_diff` for frame-diff-only testing or `--motion-source both` to merge both sources.
+The recommended default path is local Raspberry Pi `mjpg-streamer` at `127.0.0.1:8080`, full-frame NCNN detection, and JSON reporting to the PC backend. Testing showed `--roi-mode full` with `--threads 2` is faster and more stable than MOG2 ROI on this Raspberry Pi. `mjpg-streamer` usually looks smoother because it can forward camera-native MJPEG with less JPEG re-encoding and copying. `--cached-roi-ms 0` and `--full-frame-refresh-ms 0` keep cached ROI and periodic refresh disabled by default. `hybrid`/`roi` plus `--motion-source mog2` or `frame_diff` remain available for experiments.
 
 调参顺序：
 
-- 周期兜底刷新太频繁：增大 `--full-frame-refresh-ms`，例如 `2000`。
+- 需要周期兜底刷新：设置 `--full-frame-refresh-ms`，例如 `1000` 或 `2000`。
 - 人脸被 ROI 裁掉：增大 `--roi-padding-pixels`。
-- 小动作检测不够及时：降低 `--face-refresh-ms`。
+- 静止缓存框需要主动复查：设置或降低 `--cached-roi-ms`。
 - 光照变化导致误触发：增大 `--roi-min-area` 或 `--mog2-var-threshold`；如果使用帧差，再调整 `--frame-diff-threshold` 或 `--frame-diff-min-area`。
 - FPS 不够：保持 `--headless`，尝试 `--threads 2`、`3`、`4` 比较实际效果。
 
@@ -293,9 +294,9 @@ SSH 或无桌面环境请加：
 
 - 使用 `--headless`。
 - 保持输入尺寸 `640x640`，模型尺寸默认 `320x320`。
-- 优先使用 `--roi-mode hybrid`。
-- 适当增大 `--face-refresh-ms`。
-- 尝试不同 `--threads`。
+- 优先使用 `--roi-mode full`。
+- 保持 `--cached-roi-ms 0` 和 `--full-frame-refresh-ms 0`，只在需要兜底复查时开启。
+- 默认使用 `--threads 2`；如需排查性能，再对比 `--threads 1` 和 `--threads 3`。
 
 ### pip 没有树莓派 ncnn wheel
 
